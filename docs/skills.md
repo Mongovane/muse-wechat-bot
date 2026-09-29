@@ -20,6 +20,7 @@ worker（hook 唤醒 / 兜底 cron）回答问题时，按下表先读对应 ski
 | 发现某站点有哪些页面 | `skills/grok-search/scripts/map.js <站点> --limit 20` | 免 key |
 | 全网实时搜索 | Muse 自带搜索；`grok-search` 的 `search.js` 需 `GROK_API_KEY` | 未配 key 时用自带搜索 |
 | 生图 / 画图 | 先读 `skills/GPT电影感生图skill_巨物大片优化版.md` 扩写提示词，再用 Muse 图片能力出图 | outbox 加 `"image"` 字段发出 |
+| 网络审批卡 / 新域名自动放行 | `skills/muse-auto-approve.md` | 运维 skill：常驻 daemon 自动 `allow_always`，见下 |
 
 其中天气 / 热搜 / 新闻 / 小工具类调用的是免 key 的 `60s.vaneus.ccwu.cc` API，直接 curl 即可。
 各文档来自 CowAgent 仓库的 skill 说明（已获开源授权，见致谢）。
@@ -40,6 +41,14 @@ worker（hook 唤醒 / 兜底 cron）回答问题时，按下表先读对应 ski
 - 用户只说"中国龙"这类极简输入时，**不要反问**，直接按文档规则扩写成完整电影级提示词
 - 默认中文输出；用户要视频提示词时按文档的视频结构输出
 - 出图后把图片路径写进 outbox JSON 的 `"image"` 字段，`wxbot.py send` 会上传并发出
+
+## muse-auto-approve（运维 skill）
+
+`skills/muse-auto-approve.md`：微信机器人访问新域名时网页版会弹网络审批卡，
+常驻 daemon（`~/workspace/muse-auto-approve`）每 10 秒轮询并自动 `allow_always`
+永久放行。这是运维文档，不是问答 skill——只有当用户问起"审批""自动放行""新域名"
+相关问题，或报障"又有卡弹出来了"时，worker 才读它做状态检查与排障。
+部署细节（保活 cron、密码规则）见文档正文。
 
 ## 加一个新 skill（三步）
 

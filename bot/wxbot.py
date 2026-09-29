@@ -12,7 +12,7 @@ Subcommands:
   send        Send all outbox/*.json -> sent/
               (text chunked, optional "image"/"video"/"file" local paths)
 """
-import sys, os, json, time, uuid
+import sys, os, json, time, uuid, re, fcntl
 
 sys.path.insert(0, os.environ.get("COWAGENT_HOME", "/home/hatch/workspace/CowAgent"))
 from channel.weixin.weixin_api import (  # noqa: E402
@@ -27,6 +27,7 @@ INBOX = os.path.join(BASE, "inbox")
 OUTBOX = os.path.join(BASE, "outbox")
 SENT = os.path.join(BASE, "sent")
 DONE = os.path.join(BASE, "done")
+SEND_LOCK = os.path.join(BASE, "send.lock")
 MEDIA = os.path.join(BASE, "media")
 QRFILE = os.path.join(BASE, "qr.json")
 QRPNG = os.path.join(BASE, "qr.png")
@@ -131,6 +132,8 @@ def extract_text(msg):
 
 MSGCACHE = os.path.join(BASE, "msg_cache.json")
 MSGCACHE_MAX = 300
+HISTORY_DIR = os.path.join(BASE, "history")
+HISTORY_MAX_LINES = 60  # 每人最多保留 60 条（约 30 轮），超出从头丢弃
 
 
 def load_msg_cache():
@@ -140,6 +143,33 @@ def load_msg_cache():
         return d if isinstance(d, dict) else {}
     except Exception:
         return {}
+
+
+def append_history(user_id, role, text):
+    """Append one turn to the per-user conversation log.
+
+    CowAgent keeps Session.messages in memory inside a long-lived process.
+    Our workers are short-lived (one agent invocation per wake-up), so the
+    session lives on disk: history/<user_id>.jsonl, append-only, trimmed
+    from the head when over HISTORY_MAX_LINES (like discard_exceeding).
+    Workers read the tail on each wake-up to get conversation context.
+    """
+    if not user_id or not text:
+        return
+    try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_@.\-]", "_", str(user_id))[:64]
+        path = os.path.join(HISTORY_DIR, safe + ".jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "role": role, "text": text},
+                               ensure_ascii=False) + "\n")
+        with open(path) as f:
+            lines = f.readlines()
+        if len(lines) > HISTORY_MAX_LINES:
+            with open(path, "w") as f:
+                f.writelines(lines[-HISTORY_MAX_LINES:])
+    except Exception as e:
+        print("HISTORY_FAIL", e, flush=True)
 
 
 def cache_msg_text(cache, mid, text):
@@ -405,8 +435,24 @@ def cmd_receive(drain=False):
                 rec["image"] = image_path
             with open(os.path.join(INBOX, mid + ".json"), "w") as f:
                 json.dump(rec, f, ensure_ascii=False)
+            append_history(rec["from"], "user", text)  # 会话历史：用户侧
             desc = text[:30].replace("\n", " ") if text else "[图片]"
             print("INBOX", mid, desc, flush=True)
+
+
+def _is_stale_ack(fn):
+    """ack_<id>.json 是否已过期：同 id 的真正回复已经发出。
+
+    sent/<id>.json 或 done/<id>.json 存在 = 回复已送达，
+    此时再发"收到，正在想，稍等…"只会让用户困惑（2026-09-29 实测：
+    ack 的 API 请求比真正回复晚到服务器，导致先看到答案、后看到"正在想"）。
+    过期则直接归档，不再发送。
+    """
+    if not fn.startswith("ack_"):
+        return False
+    base = fn[len("ack_"):]
+    return (os.path.exists(os.path.join(SENT, base))
+            or os.path.exists(os.path.join(DONE, base)))
 
 
 def cmd_send():
@@ -414,13 +460,38 @@ def cmd_send():
     api = WeixinApi(base_url=creds.get("base_url", DEFAULT_BASE_URL),
                     token=creds.get("token", ""))
     msg_cache = load_msg_cache()  # 记下发出去的消息，供引用解析
+    # 互斥：ack_timer 和 worker 可能同时起 send 进程。无锁时两个进程会各自
+    # 看到 outbox 里对方的文件、按文件名排序发出，导致顺序错乱甚至重复发送
+    # （2026-09-29 实测）。flock 随进程结束自动释放；单次发送有 15s 超时上限，
+    # 不会无限持有锁。
+    lock_fh = open(SEND_LOCK, "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        _cmd_send_locked(api, msg_cache)
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fh.close()
+
+
+def _cmd_send_locked(api, msg_cache):
     files = sorted(f for f in os.listdir(OUTBOX) if f.endswith(".json"))
     for fn in files:
         path = os.path.join(OUTBOX, fn)
+        if _is_stale_ack(fn):
+            try:
+                os.replace(path, os.path.join(SENT, fn))
+            except OSError:
+                pass
+            print("SENT_SKIP_STALE_ACK", fn, flush=True)
+            continue
         try:
             with open(path) as f:
                 job = json.load(f)
             to, ctx, text = job["to"], job.get("context_token", ""), job.get("text", "")
+            reply_parts = []  # 本次实际发出的内容，整单成功后一次性记入历史
             chunks = split_text(text) or [""]
             for ch in chunks:
                 r = send_text_retry(api, to, ctx, ch, fn)
@@ -428,6 +499,7 @@ def cmd_send():
                     print("SEND_FAIL", fn, r, flush=True)
                     break
                 cache_msg_text(msg_cache, _resp_msg_id(r), ch)
+                reply_parts.append(ch)
                 time.sleep(0.5)
             else:
                 img = job.get("image")
@@ -443,6 +515,7 @@ def cmd_send():
                         print("SEND_FAIL", fn, "image:", r, flush=True)
                         continue
                     cache_msg_text(msg_cache, _resp_msg_id(r), "[图片]")
+                    reply_parts.append("[图片]")
                     time.sleep(0.5)
                 vid = job.get("video")
                 if vid:
@@ -457,6 +530,7 @@ def cmd_send():
                         print("SEND_FAIL", fn, "video:", r, flush=True)
                         continue
                     cache_msg_text(msg_cache, _resp_msg_id(r), "[视频]")
+                    reply_parts.append("[视频]")
                     time.sleep(0.5)
                 fpath = job.get("file")
                 if fpath:
@@ -473,9 +547,12 @@ def cmd_send():
                         continue
                     cache_msg_text(msg_cache, _resp_msg_id(r),
                                    "[文件] " + os.path.basename(fpath))
+                    reply_parts.append("[文件] " + os.path.basename(fpath))
                     time.sleep(0.5)
                 if os.path.exists(SEND_EXPIRED_MARKER):
                     os.remove(SEND_EXPIRED_MARKER)
+                append_history(to, "assistant",  # 会话历史：整单成功才记
+                               "\n".join(p for p in reply_parts if p) or "[空回复]")
                 os.replace(path, os.path.join(SENT, fn))
                 print("SENT", fn, flush=True)
                 continue

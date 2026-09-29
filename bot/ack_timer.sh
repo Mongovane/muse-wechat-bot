@@ -4,10 +4,10 @@
 # 背景：ilink 协议的 send_typing 调通了（ret=0）但微信客户端不渲染，
 # 所以用一条延迟的文字提示来填补"思考中"的沉默期。
 #
-# 用法: ack_timer.sh <msg_id> <to> <context_token> [delay秒，默认20] [提示文案]
+# 用法: ack_timer.sh <msg_id> <to> <context_token> [delay秒，默认10] [提示文案]
 #
 # worker 认领消息后立刻在后台启动：
-#   setsid nohup bash ~/workspace/wechat-bot/ack_timer.sh <id> <to> <ctx> 20 \
+#   setsid nohup bash ~/workspace/wechat-bot/ack_timer.sh <id> <to> <ctx> 10 \
 #     > /dev/null 2>&1 < /dev/null &
 #
 # delay 秒后：
@@ -18,7 +18,7 @@ set -u
 ID="${1:?msg_id required}"
 TO="${2:?to required}"
 CTX="${3:?context_token required}"
-DELAY="${4:-15}"
+DELAY="${4:-10}"
 TEXT="${5:-收到，正在想，稍等…}"
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

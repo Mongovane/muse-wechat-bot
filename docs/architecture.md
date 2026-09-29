@@ -64,6 +64,12 @@ hook worker 和兜底 cron 可能同时看到同一个文件。规则只有一�
 - 发送：`ilink/bot/sendmessage`，`message_type == 2`，长文本按 3500 字分段、`0.5s` 间隔发出
 - 图片：`upload_media_to_cdn`（AES 加密上传）→ `send_image_item`
 - 以上全部封装在 CowAgent 的 `channel/weixin/weixin_api.py`，`wxbot.py` 只是薄封装
+- 网络优化（2026-09-29）：实测本机到 `ilinkai.weixin.qq.com` 建连仅 6ms、TLS 握手约 90ms，
+  网络本身不是瓶颈。但原来每次 `_post` 都是全新 `requests.post`（每次握手），
+  已给 `WeixinApi` 加上进程内持久 Session（keep-alive，见 `bot/patches/cowagent-keepalive.patch`，
+  已提交进本地 CowAgent 克隆），多段回复/连续调用复用同一连接，每请求省约 0.1 秒；
+  连接层错误时自动丢弃重建。短命的 `send` 进程立即生效；常驻 `receive` 进程下次重启后生效
+  （它每次 35 秒长轮询，收益可忽略，不主动重启）
 
 ## 延迟构成
 
@@ -76,7 +82,7 @@ hook worker 和兜底 cron 可能同时看到同一个文件。规则只有一�
 
 ilink 协议的 `send_typing` 实测调通（`typing_ticket` 从 `get_config(user_id)` 取，
 每次 `ret=0`），但微信客户端不渲染，属协议限制。所以用 `bot/ack_timer.sh`
-代替：worker 认领消息后立刻在后台启动它，15 秒后若还没回完（`processing/<id>.json`
+代替：worker 认领消息后立刻在后台启动它，10 秒后若还没回完（`processing/<id>.json`
 还在、且 `outbox/<id>.json` 还没写好），就发一条"收到，正在想，稍等…"；
 回得快则静默退出，绝不打扰。三个分支都经过实测。
 
@@ -109,3 +115,16 @@ ilink 协议的 `send_typing` 实测调通（`typing_ticket` 从 `get_config(use
 结论：CowAgent 同样是非流式、单 session 串行，速度上没有更快的招；
 `send_typing` 之外协议层已无遗漏。它的 D（图/文合并）设计是"文字等图 3 秒、
 纯图不触发回复"，与之前否掉的方案不同，如需可再议。
+
+## 会话上下文（2026-09-29，参考 CowAgent Session 思路）
+
+- CowAgent 是常驻进程，Session.messages 放内存；本项目的 worker 每次是全新唤醒，所以会话落盘为 `history/<user_id>.jsonl`（append-only JSONL，每行 `{ts, role, text}`）。
+- receiver 写 inbox 时记 `user` 侧；`wxbot.py send` 整单成功后记 `assistant` 侧（多分片合并为一条）。
+- 超过 60 行（约 30 轮）从头丢弃，对应 CowAgent 的 `discard_exceeding`。
+- worker 作答前读尾部 30 行作上下文；涉及长期记忆（偏好、过去的事、记忆里的人）时用 Muse 的 memory_search，Peter 的持久新事实写回记忆。注意微信对面可能是 Peter 的朋友而非本人，隐私不外传。
+
+## 发送互斥与过期 ack（2026-09-29）
+
+- `wxbot.py send` 用 `send.lock` + `flock(LOCK_EX)` 互斥：ack_timer 和 worker 会并发起 send 进程，无锁时各自看到 outbox 里对方的文件、按文件名排序发出，曾实测导致"收到，正在想，稍等…"排在真正回复之后到达用户。
+- 过期 ack 跳过：`_is_stale_ack()` 发现同 id 的真正回复已发出（`sent/<id>.json` 或 `done/<id>.json` 存在）时，直接把 `ack_<id>.json` 归档不再发送。
+- 单次发送 API 超时 15s、有重试上限，锁不会被无限持有；flock 随进程结束自动释放。

@@ -1,0 +1,41 @@
+diff --git a/channel/weixin/weixin_api.py b/channel/weixin/weixin_api.py
+index 672a0711..9f7da4bd 100644
+--- a/channel/weixin/weixin_api.py
++++ b/channel/weixin/weixin_api.py
+@@ -131,6 +131,14 @@ class WeixinApi:
+         self.base_url = base_url
+         self.token = token
+         self.cdn_base_url = cdn_base_url
++        # 持久 HTTP 连接（keep-alive）：同一进程内的多次 API 调用复用 TCP+TLS，
++        # 每请求省一次握手（约 0.1s）。连接失效时自动丢弃重建。
++        self._session = None
++
++    def _http(self) -> "requests.Session":
++        if self._session is None:
++            self._session = requests.Session()
++        return self._session
+ 
+     def _post(self, endpoint: str, body: dict, timeout: int = DEFAULT_API_TIMEOUT,
+               retries: int = 0) -> dict:
+@@ -140,7 +148,7 @@ class WeixinApi:
+         attempt = 0
+         while True:
+             try:
+-                resp = requests.post(url, json=body, headers=headers, timeout=timeout)
++                resp = self._http().post(url, json=body, headers=headers, timeout=timeout)
+                 resp.raise_for_status()
+                 return resp.json()
+             except requests.exceptions.Timeout:
+@@ -149,6 +157,12 @@ class WeixinApi:
+             except (requests.exceptions.SSLError,
+                     requests.exceptions.ConnectionError,
+                     requests.exceptions.ChunkedEncodingError) as e:
++                # 连接池里的陈旧连接可能已失效：丢弃 session，下次调用重建
++                try:
++                    self._session.close()
++                except Exception:
++                    pass
++                self._session = None
+                 # Transient transport-level errors (e.g. SSLEOFError from the
+                 # peer dropping the connection) are usually recoverable, so
+                 # retry a few times with exponential backoff before giving up.
