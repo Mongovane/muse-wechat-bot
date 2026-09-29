@@ -28,6 +28,15 @@ if ! pgrep -f "[w]xbot.py receive" >/dev/null 2>&1; then
     log "receiver restarted" '{}'
     # fall through to inbox check below
   fi
+else
+  # receiver 活着 = 登录态有效，清除"已通知"标记，下次过期可再次提醒
+  rm -f "$RELOGIN_FLAG"
+fi
+
+# --- 1b. send-side session expiry (marker dropped by wxbot.py send on ret=-14) ---
+if [ -f "$BOT_DIR/.send_session_expired" ] && [ ! -f "$RELOGIN_FLAG" ]; then
+  touch "$RELOGIN_FLAG"
+  wake "微信发送侧登录态过期（send 返回 -14），需要用户重新扫码登录" '{"need_relogin":true}'
 fi
 
 # --- 2. inbox: any new messages? ---

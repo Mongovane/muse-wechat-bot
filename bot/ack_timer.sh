@@ -18,7 +18,7 @@ set -u
 ID="${1:?msg_id required}"
 TO="${2:?to required}"
 CTX="${3:?context_token required}"
-DELAY="${4:-20}"
+DELAY="${4:-15}"
 TEXT="${5:-收到，正在想，稍等…}"
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

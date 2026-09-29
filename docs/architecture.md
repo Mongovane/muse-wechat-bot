@@ -76,7 +76,7 @@ hook worker 和兜底 cron 可能同时看到同一个文件。规则只有一�
 
 ilink 协议的 `send_typing` 实测调通（`typing_ticket` 从 `get_config(user_id)` 取，
 每次 `ret=0`），但微信客户端不渲染，属协议限制。所以用 `bot/ack_timer.sh`
-代替：worker 认领消息后立刻在后台启动它，20 秒后若还没回完（`processing/<id>.json`
+代替：worker 认领消息后立刻在后台启动它，15 秒后若还没回完（`processing/<id>.json`
 还在、且 `outbox/<id>.json` 还没写好），就发一条"收到，正在想，稍等…"；
 回得快则静默退出，绝不打扰。三个分支都经过实测。
 
@@ -85,3 +85,27 @@ ilink 协议的 `send_typing` 实测调通（`typing_ticket` 从 `get_config(use
 微信发送是"以用户名义对外说话"的敏感操作。默认每次发送都要用户在审批卡上确认。
 正道是给定时任务授**长期许可**（只覆盖该任务，设置页可撤销），不要绕过。
 详见 [setup.md](setup.md) 第 9 步。
+
+## CowAgent 借鉴（2026-09-29）
+
+深挖 `channel/weixin/` 后搬过来的东西（`wxbot.py` 内有标注出处）：
+
+- **引用消息解析**：`extract_ref_text()` + `msg_cache.json`。实测发现 ilink 的
+  `ref_msg` 只带被引用消息的 `msg_id`（`message_item.type == 0`，无原文——
+  CowAgent 的内联 title/text 假设不成立）；接收器把双向消息原文按 `msg_id`
+  缓存（最近 300 条），引用时查缓存拼出 `[引用: 原文]` 前缀；缓存未命中时
+  兜底 `[引用: 早些的消息]`。**注意**：服务端不回显 bot 自己的消息，
+  type-2 轮询分支是死代码；发送侧改为从 `sendmessage` 响应的
+  `message_id` 字段直接缓存（文字分片/图片/视频/文件均记）。
+- **段落感知分段**：`split_text()` 照抄 CowAgent `_split_text`——优先在 `\n\n` /
+  `\n` 处断句，取代原来的 3500 字硬切。
+- **发送重试**：`send_text_retry()` 文字 chunk 失败/异常时隔 3 秒重试 1 次。
+- **发送侧 -14 感知**：`check_send_response()` 发现 `ret/errcode == -14` 时写
+  `.send_session_expired` 标记文件，hook 脚本检测到后提醒用户重新扫码；
+  整单成功后自动清除标记。
+- **视频/文件不再静默丢弃**：收到 `type == 4/5` 的消息转成 `[文件]`/`[视频]`
+  进 inbox，由 Muse 如实回复"暂时看不了"，而不是装没看见。
+
+结论：CowAgent 同样是非流式、单 session 串行，速度上没有更快的招；
+`send_typing` 之外协议层已无遗漏。它的 D（图/文合并）设计是"文字等图 3 秒、
+纯图不触发回复"，与之前否掉的方案不同，如需可再议。

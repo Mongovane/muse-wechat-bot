@@ -129,6 +129,147 @@ def extract_text(msg):
     return "".join(parts).strip()
 
 
+MSGCACHE = os.path.join(BASE, "msg_cache.json")
+MSGCACHE_MAX = 300
+
+
+def load_msg_cache():
+    try:
+        with open(MSGCACHE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def cache_msg_text(cache, mid, text):
+    """Cache recent message texts (both directions) so quoted messages can be resolved.
+
+    Merges with the on-disk file before writing: the receiver holds a long-lived
+    in-memory copy while cmd_send (a separate short-lived process) also writes.
+    Without the merge, whichever process writes last silently wipes the other's
+    entries (this broke quote-reply resolution for bot-sent messages).
+    """
+    if not mid or not text:
+        return
+    try:
+        with open(MSGCACHE) as f:
+            disk = json.load(f)
+        if isinstance(disk, dict):
+            for k, v in disk.items():
+                if k not in cache:
+                    cache[k] = v
+    except Exception:
+        pass
+    cache[str(mid)] = text
+    while len(cache) > MSGCACHE_MAX:
+        cache.pop(next(iter(cache)))
+    try:
+        with open(MSGCACHE, "w") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except Exception as e:
+        print("CACHE_SAVE_FAIL", e, flush=True)
+
+
+def _resp_msg_id(r):
+    """Extract the server-assigned message id from a send response.
+
+    Confirmed 2026-09-29: the response carries top-level "message_id".
+    Other shapes are kept as harmless fallbacks.
+    """
+    if isinstance(r, dict):
+        for k in ("message_id", "msg_id", "msgid", "id"):
+            if r.get(k):
+                return r.get(k)
+        data = r.get("data")
+        if isinstance(data, dict):
+            for k in ("message_id", "msg_id", "msgid", "id"):
+                if data.get(k):
+                    return data.get(k)
+    return None
+
+
+def extract_ref_text(msg, cache):
+    """Resolve a quoted message to a '[引用: ...]' prefix.
+
+    Real ilink behavior (captured 2026-09-29): ref_msg carries ONLY the quoted
+    message's msg_id (message_item.type == 0), not its text -- CowAgent's
+    parser assumes inline title/text and misses it. We resolve the id against
+    recent messages cached by the receiver (both incoming and our own replies).
+    """
+    for item in msg.get("item_list", []) or []:
+        ref = item.get("ref_msg") or {}
+        if not ref:
+            continue
+        ref_mi = ref.get("message_item") or {}
+        ref_title = ref.get("title", "") or ""
+        ref_body = ""
+        if ref_mi.get("type") == 1:  # inline text (CowAgent's assumed shape, kept as fallback)
+            ref_body = (ref_mi.get("text_item") or {}).get("text", "") or ""
+        qid = str(ref_mi.get("msg_id", "") or "")
+        if not ref_body and qid:
+            ref_body = cache.get(qid, "")
+        bits = [p for p in (ref_title, ref_body) if p]
+        if bits:
+            return "[引用: %s]\n" % " | ".join(bits)
+        return "[引用: 早些的消息]\n"
+    return ""
+
+
+def split_text(text, limit=CHUNK):
+    """Split text into chunks, preferring paragraph/line boundaries (from CowAgent)."""
+    if len(text) <= limit:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+        cut = text.rfind("\n\n", 0, limit)
+        if cut <= 0:
+            cut = text.rfind("\n", 0, limit)
+        if cut <= 0:
+            cut = limit
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip("\n")
+    return chunks
+
+
+SEND_EXPIRED_MARKER = os.path.join(BASE, ".send_session_expired")
+
+
+def check_send_response(resp, fn=""):
+    """Detect ilink -14 (session expired) on the send side (from CowAgent).
+
+    The receiver already handles -14 on get_updates; this covers the blind
+    spot where sending fails because the login went stale. Drops a marker
+    file so the hook/sweeper can tell the user to rescan.
+    """
+    if not isinstance(resp, dict):
+        return
+    if resp.get("ret") == -14 or resp.get("errcode") == -14:
+        print("SESSION_EXPIRED_SEND", fn, flush=True)
+        with open(SEND_EXPIRED_MARKER, "w") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), fn))
+
+
+def send_text_retry(api, to, ctx, txt, fn=""):
+    """Send one text chunk with one retry (from CowAgent's _send retry)."""
+    r = None
+    for _ in range(2):
+        try:
+            r = api.send_text(to, txt, ctx)
+        except Exception as e:
+            print("SEND_EXC", fn, e, flush=True)
+            r = None
+        if r is not None:
+            check_send_response(r, fn)
+            if r.get("ret", 0) == 0:
+                return r
+        time.sleep(3)
+    return r
+
+
 def find_image_item(msg):
     """Return the image item dict (type 2) from a raw message, or None."""
     for item in msg.get("item_list", []) or []:
@@ -178,6 +319,7 @@ def cmd_receive(drain=False):
     buf = open(BUF).read().strip() if os.path.exists(BUF) else ""
     seen = set()
     failures = 0
+    msg_cache = load_msg_cache()
     while True:
         try:
             resp = api.get_updates(buf)
@@ -203,7 +345,15 @@ def cmd_receive(drain=False):
         with open(BUF, "w") as f:
             f.write(buf)
         for m in resp.get("msgs", []) or []:
-            if m.get("message_type", 0) != 1:
+            mtype = m.get("message_type", 0)
+            if mtype == 2:
+                # 自己发出去的消息：记入引用解析缓存，不回复
+                t2 = extract_text(m)
+                if t2:
+                    cache_msg_text(msg_cache,
+                                   m.get("message_id", m.get("seq", "")), t2)
+                continue
+            if mtype != 1:
                 continue
             mid = str(m.get("message_id", m.get("seq", uuid.uuid4().hex[:8])))
             if mid in seen:
@@ -221,11 +371,32 @@ def cmd_receive(drain=False):
             if img_item:
                 image_path = download_inbound_image(api, img_item, mid)
             if not text and not image_path:
-                continue
+                # 用户发了视频/文件：以前静默丢弃，现在转成标记让 worker 看到、
+                # 由 Muse 如实回复"收到了但暂时看不了"，而不是装没看见
+                media_note = ""
+                for item in m.get("item_list", []) or []:
+                    itype = item.get("type", 0)
+                    if itype == 5:
+                        media_note = "[视频]"
+                        break
+                    if itype == 4:
+                        media_note = "[文件]"
+                        break
+                if not media_note:
+                    continue
+                text = media_note
+            if not text and image_path:
+                text = "[图片]"
+            # 引用解析：把被引用消息的原文拼到前面，worker 才知道用户在问哪一句
+            ref_prefix = extract_ref_text(m, msg_cache)
+            if ref_prefix:
+                text = ref_prefix + text
+            # 缓存收到的文字（含 [图片]/[语音]/[视频]/[文件] 标记），供后续引用解析
+            cache_msg_text(msg_cache, mid, text)
             rec = {
                 "msg_id": mid,
                 "from": m.get("from_user_id", ""),
-                "text": text if text else ("[图片]" if image_path else ""),
+                "text": text,
                 "context_token": m.get("context_token", ""),
                 "session_id": m.get("session_id", ""),
                 "ts": time.time(),
@@ -242,6 +413,7 @@ def cmd_send():
     creds = load_creds()
     api = WeixinApi(base_url=creds.get("base_url", DEFAULT_BASE_URL),
                     token=creds.get("token", ""))
+    msg_cache = load_msg_cache()  # 记下发出去的消息，供引用解析
     files = sorted(f for f in os.listdir(OUTBOX) if f.endswith(".json"))
     for fn in files:
         path = os.path.join(OUTBOX, fn)
@@ -249,12 +421,13 @@ def cmd_send():
             with open(path) as f:
                 job = json.load(f)
             to, ctx, text = job["to"], job.get("context_token", ""), job.get("text", "")
-            chunks = [text[i:i + CHUNK] for i in range(0, len(text), CHUNK)] or [""]
+            chunks = split_text(text) or [""]
             for ch in chunks:
-                r = api.send_text(to, ch, ctx)
-                if r.get("ret", 0) != 0:
+                r = send_text_retry(api, to, ctx, ch, fn)
+                if not r or r.get("ret", 0) != 0:
                     print("SEND_FAIL", fn, r, flush=True)
                     break
+                cache_msg_text(msg_cache, _resp_msg_id(r), ch)
                 time.sleep(0.5)
             else:
                 img = job.get("image")
@@ -265,9 +438,11 @@ def cmd_send():
                     up = upload_media_to_cdn(api, img, to, media_type=1)
                     r = api.send_image_item(to, ctx, up["encrypt_query_param"],
                                             up["aes_key_b64"], up["ciphertext_size"])
+                    check_send_response(r, fn)
                     if r.get("ret", 0) != 0:
                         print("SEND_FAIL", fn, "image:", r, flush=True)
                         continue
+                    cache_msg_text(msg_cache, _resp_msg_id(r), "[图片]")
                     time.sleep(0.5)
                 vid = job.get("video")
                 if vid:
@@ -277,9 +452,11 @@ def cmd_send():
                     up = upload_media_to_cdn(api, vid, to, media_type=2)
                     r = api.send_video_item(to, ctx, up["encrypt_query_param"],
                                             up["aes_key_b64"], up["ciphertext_size"])
+                    check_send_response(r, fn)
                     if r.get("ret", 0) != 0:
                         print("SEND_FAIL", fn, "video:", r, flush=True)
                         continue
+                    cache_msg_text(msg_cache, _resp_msg_id(r), "[视频]")
                     time.sleep(0.5)
                 fpath = job.get("file")
                 if fpath:
@@ -290,10 +467,15 @@ def cmd_send():
                     r = api.send_file_item(to, ctx, up["encrypt_query_param"],
                                            up["aes_key_b64"],
                                            os.path.basename(fpath), up["raw_size"])
+                    check_send_response(r, fn)
                     if r.get("ret", 0) != 0:
                         print("SEND_FAIL", fn, "file:", r, flush=True)
                         continue
+                    cache_msg_text(msg_cache, _resp_msg_id(r),
+                                   "[文件] " + os.path.basename(fpath))
                     time.sleep(0.5)
+                if os.path.exists(SEND_EXPIRED_MARKER):
+                    os.remove(SEND_EXPIRED_MARKER)
                 os.replace(path, os.path.join(SENT, fn))
                 print("SENT", fn, flush=True)
                 continue
