@@ -22,6 +22,19 @@
 worker 用 `mv` 原子认领到 `processing/` → Muse 中文作答（按需调 skill）→
 `outbox/<msg_id>.json` → `wxbot.py send` 发出（含图片上传）→ 归档到 `done/`。
 
+图片消息：用户发的图片/截图以 `message_type == 1` 到达，但 `item_list` 里是
+`type == 2` 的图片项而非文字。`wxbot.py receive` 会自动从微信 CDN 下载原图到
+`media/in_<msg_id>.jpg`，并在 inbox 记录里加 `image` 字段；worker 用 read 工具
+打开图片看清内容后再作答。
+
+语音消息：`item_list` 里 `type == 3` 的语音项如带服务端转写文本
+（`voice_item.text`），receive 会将其转为 `[语音] <转写>` 的文字消息处理；
+无转写的语音目前跳过。
+
+发送：`wxbot.py send` 按 outbox JSON 发送——`text` 分段发送（每段 3500 字），
+可选 `"image"`（本地图片路径→CDN 上传→图片消息）、`"video"`（本地视频路径→
+视频消息）、`"file"`（本地文件路径→文件消息，原文件名发出）。
+
 ## 为什么是事件驱动而不是定时轮询
 
 最早是每分钟 cron 轮询：消息来了平均干等 30 秒才被发现。现在：
@@ -55,9 +68,17 @@ hook worker 和兜底 cron 可能同时看到同一个文件。规则只有一�
 ## 延迟构成
 
 1. 微信 → 接收器：长轮询，几秒
-2. 发现：hook 10 秒内（原来 cron 方案平均 30 秒）
+2. 发现：hook 5 秒内（原来 cron 方案平均 30 秒）
 3. 作答：worker agent 运行，简单问题约 20–40 秒，复杂问题（联网查、长思考） irreducible
 4. 发送：1–2 秒
+
+### "对方正在输入"的替代方案
+
+ilink 协议的 `send_typing` 实测调通（`typing_ticket` 从 `get_config(user_id)` 取，
+每次 `ret=0`），但微信客户端不渲染，属协议限制。所以用 `bot/ack_timer.sh`
+代替：worker 认领消息后立刻在后台启动它，20 秒后若还没回完（`processing/<id>.json`
+还在、且 `outbox/<id>.json` 还没写好），就发一条"收到，正在想，稍等…"；
+回得快则静默退出，绝不打扰。三个分支都经过实测。
 
 ## 审批模型
 

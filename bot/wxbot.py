@@ -8,12 +8,17 @@ Subcommands:
   qr          Fetch login QR code -> qr.json (+ qr.png)
   wait_login  Poll QR status until confirmed/expired/timeout -> credentials.json
   receive     Daemon: long-poll getUpdates -> inbox/<msg_id>.json
-  send        Send all outbox/*.json via send_text -> sent/
+              (text, server-transcribed voice, images downloaded from CDN)
+  send        Send all outbox/*.json -> sent/
+              (text chunked, optional "image"/"video"/"file" local paths)
 """
 import sys, os, json, time, uuid
 
 sys.path.insert(0, os.environ.get("COWAGENT_HOME", "/home/hatch/workspace/CowAgent"))
-from channel.weixin.weixin_api import WeixinApi, DEFAULT_BASE_URL, upload_media_to_cdn  # noqa: E402
+from channel.weixin.weixin_api import (  # noqa: E402
+    WeixinApi, DEFAULT_BASE_URL, upload_media_to_cdn,
+    download_media_from_cdn, CDN_BASE_URL,
+)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CREDS = os.path.join(BASE, "credentials.json")
@@ -22,12 +27,13 @@ INBOX = os.path.join(BASE, "inbox")
 OUTBOX = os.path.join(BASE, "outbox")
 SENT = os.path.join(BASE, "sent")
 DONE = os.path.join(BASE, "done")
+MEDIA = os.path.join(BASE, "media")
 QRFILE = os.path.join(BASE, "qr.json")
 QRPNG = os.path.join(BASE, "qr.png")
 SESSION_EXPIRED = -14
 CHUNK = 3500
 
-for d in (INBOX, OUTBOX, SENT, DONE):
+for d in (INBOX, OUTBOX, SENT, DONE, MEDIA):
     os.makedirs(d, exist_ok=True)
 
 
@@ -123,6 +129,48 @@ def extract_text(msg):
     return "".join(parts).strip()
 
 
+def find_image_item(msg):
+    """Return the image item dict (type 2) from a raw message, or None."""
+    for item in msg.get("item_list", []) or []:
+        if item.get("type") == 2:
+            return item
+        ref_mi = (item.get("ref_msg") or {}).get("message_item", {})
+        if ref_mi.get("type") == 2:
+            return ref_mi
+    return None
+
+
+def extract_voice_text(msg):
+    """Return server-side transcription of a voice message (type 3), or ''."""
+    for item in msg.get("item_list", []) or []:
+        if item.get("type") == 3:
+            t = (item.get("voice_item") or {}).get("text", "")
+            if t:
+                return t.strip()
+    return ""
+
+
+def download_inbound_image(api, item, mid):
+    """Download an inbound image message from Weixin CDN. Returns local path or ''."""
+    info = item.get("image_item", {})
+    media = info.get("media", {})
+    encrypt_param = media.get("encrypt_query_param", "")
+    aes_key = info.get("aeskey", "") or media.get("aes_key", "")
+    if not encrypt_param or not aes_key:
+        print("IMG_NOPARAM", mid, flush=True)
+        return ""
+    os.makedirs(MEDIA, exist_ok=True)
+    save_path = os.path.join(MEDIA, "in_%s.jpg" % mid)
+    try:
+        cdn_base = getattr(api, "cdn_base_url", "") or CDN_BASE_URL
+        download_media_from_cdn(cdn_base, encrypt_param, aes_key, save_path)
+        print("IMG_SAVED", mid, save_path, flush=True)
+        return save_path
+    except Exception as e:
+        print("IMG_FAIL", mid, e, flush=True)
+        return ""
+
+
 def cmd_receive(drain=False):
     creds = load_creds()
     api = WeixinApi(base_url=creds.get("base_url", DEFAULT_BASE_URL),
@@ -165,17 +213,29 @@ def cmd_receive(drain=False):
                 continue
             text = extract_text(m)
             if not text:
+                vt = extract_voice_text(m)
+                if vt:
+                    text = "[语音] " + vt
+            image_path = ""
+            img_item = find_image_item(m)
+            if img_item:
+                image_path = download_inbound_image(api, img_item, mid)
+            if not text and not image_path:
                 continue
             rec = {
                 "msg_id": mid,
                 "from": m.get("from_user_id", ""),
-                "text": text,
+                "text": text if text else ("[图片]" if image_path else ""),
                 "context_token": m.get("context_token", ""),
+                "session_id": m.get("session_id", ""),
                 "ts": time.time(),
             }
+            if image_path:
+                rec["image"] = image_path
             with open(os.path.join(INBOX, mid + ".json"), "w") as f:
                 json.dump(rec, f, ensure_ascii=False)
-            print("INBOX", mid, (text[:30].replace("\n", " ")), flush=True)
+            desc = text[:30].replace("\n", " ") if text else "[图片]"
+            print("INBOX", mid, desc, flush=True)
 
 
 def cmd_send():
@@ -207,6 +267,31 @@ def cmd_send():
                                             up["aes_key_b64"], up["ciphertext_size"])
                     if r.get("ret", 0) != 0:
                         print("SEND_FAIL", fn, "image:", r, flush=True)
+                        continue
+                    time.sleep(0.5)
+                vid = job.get("video")
+                if vid:
+                    if not os.path.isfile(vid):
+                        print("SEND_FAIL", fn, "video not found:", vid, flush=True)
+                        continue
+                    up = upload_media_to_cdn(api, vid, to, media_type=2)
+                    r = api.send_video_item(to, ctx, up["encrypt_query_param"],
+                                            up["aes_key_b64"], up["ciphertext_size"])
+                    if r.get("ret", 0) != 0:
+                        print("SEND_FAIL", fn, "video:", r, flush=True)
+                        continue
+                    time.sleep(0.5)
+                fpath = job.get("file")
+                if fpath:
+                    if not os.path.isfile(fpath):
+                        print("SEND_FAIL", fn, "file not found:", fpath, flush=True)
+                        continue
+                    up = upload_media_to_cdn(api, fpath, to, media_type=3)
+                    r = api.send_file_item(to, ctx, up["encrypt_query_param"],
+                                           up["aes_key_b64"],
+                                           os.path.basename(fpath), up["raw_size"])
+                    if r.get("ret", 0) != 0:
+                        print("SEND_FAIL", fn, "file:", r, flush=True)
                         continue
                     time.sleep(0.5)
                 os.replace(path, os.path.join(SENT, fn))
