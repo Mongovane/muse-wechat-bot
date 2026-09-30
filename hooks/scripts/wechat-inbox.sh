@@ -33,6 +33,50 @@ if ! pgrep -f "[w]xbot.py receive" >/dev/null 2>&1; then
 else
   # receiver 活着 = 登录态有效，清除"已通知"标记，下次过期可再次提醒
   rm -f "$RELOGIN_FLAG"
+  # --- 1a. stuck detection: alive but not polling? ---
+  # buf.txt is rewritten on EVERY getupdates return (<= ~40s when healthy,
+  # even with zero messages). receiver.log is silent during healthy idle, so
+  # log mtime is NOT a stuck signal (2026-09-30 12:15: receiver stuck 29 min
+  # inside a hung POST, misjudged as "quiet period" until manual kill).
+  _now="$(date +%s)"
+  _buf_mtime="$(stat -c %Y "$BOT_DIR/buf.txt" 2>/dev/null || echo 0)"
+  if [ "$((_now - _buf_mtime))" -gt 180 ]; then
+    _stuck=1
+    for _pid in $(pgrep -f "[w]xbot.py receive" || true); do
+      _etimes="$(ps -o etimes= -p "$_pid" 2>/dev/null | tr -d ' ')"
+      # a freshly started receiver hasn't had time to rewrite buf.txt yet
+      if [ -n "$_etimes" ] && [ "$_etimes" -lt 180 ]; then _stuck=0; fi
+    done
+    if [ "$_stuck" -eq 1 ]; then
+      log "receiver stuck (buf.txt stale $((_now - _buf_mtime))s), restarting" '{}'
+      _pids="$(pgrep -f "[w]xbot.py receive" || true)"
+      if [ -n "$_pids" ]; then kill $_pids 2>/dev/null || true; fi
+      sleep 3
+      _pids="$(pgrep -f "[w]xbot.py receive" || true)"
+      if [ -n "$_pids" ]; then kill -9 $_pids 2>/dev/null || true; sleep 1; fi
+      if ! pgrep -f "[w]xbot.py receive" >/dev/null 2>&1; then
+        cd "$BOT_DIR"
+        cp -f receiver.log receiver.log.prev 2>/dev/null || true
+        setsid nohup "$BOT_PYTHON" wxbot.py receive \
+          > receiver.log 2>&1 < /dev/null &
+        sleep 2
+        # dedup: the setsid/nohup dance has left 2 same-name instances before;
+        # keep the oldest, kill the rest
+        _pids="$(pgrep -f "[w]xbot.py receive" || true)"
+        if [ "$(echo "$_pids" | wc -w)" -gt 1 ]; then
+          _keep="$(echo "$_pids" | head -n 1)"
+          for _p in $_pids; do
+            if [ "$_p" != "$_keep" ]; then kill -9 "$_p" 2>/dev/null || true; fi
+          done
+          log "receiver dedup after stuck-restart: kept $_keep" '{}'
+        fi
+        log "receiver restarted after stuck" '{}'
+      else
+        log "receiver stuck but refusing to die, left for cron" '{}'
+      fi
+    fi
+    unset _now _buf_mtime _stuck _pid _etimes _pids _keep _p
+  fi
 fi
 
 # --- 1b. send-side session expiry (marker dropped by wxbot.py send on ret=-14) ---
