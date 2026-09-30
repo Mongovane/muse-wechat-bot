@@ -658,6 +658,11 @@ def cmd_finish(msg_id):
         os.replace(proc_path, os.path.join(DONE, msg_id + ".json"))
     except OSError as e:
         print("FINISH_WARN", msg_id, "done move failed:", e, flush=True)
+    # Clean up the watchdog alive marker (worker started OK).
+    try:
+        os.remove(os.path.join(PROCESSING, msg_id + ".alive"))
+    except OSError:
+        pass
     t_sent = time.time()
     note = ("image" if job.get("image") else
             "video" if job.get("video") else

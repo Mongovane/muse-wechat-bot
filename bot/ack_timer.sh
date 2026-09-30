@@ -19,7 +19,7 @@ ID="${1:?msg_id required}"
 TO="${2:?to required}"
 CTX="${3:?context_token required}"
 DELAY="${4:-10}"
-TEXT="${5:-收到，正在想，稍等…}"
+TEXT="${5:-收到你的消息啦，我需要大约半分钟思考一下~}"
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${WECHAT_BOT_PYTHON:-$HOME/workspace/CowAgent/venv/bin/python}"
