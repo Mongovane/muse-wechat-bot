@@ -11,6 +11,9 @@ Subcommands:
               (text, server-transcribed voice, images downloaded from CDN)
   send        Send all outbox/*.json -> sent/
               (text chunked, optional "image"/"video"/"file" local paths)
+  finish      Worker one-shot: send outbox/<id>.json, move processing/<id>.json
+              -> done/, append latency entry. FINISH_FAIL leaves processing/
+              for the 5-min fallback sweeper.
 """
 import sys, os, json, time, uuid, re, fcntl
 
@@ -27,14 +30,17 @@ INBOX = os.path.join(BASE, "inbox")
 OUTBOX = os.path.join(BASE, "outbox")
 SENT = os.path.join(BASE, "sent")
 DONE = os.path.join(BASE, "done")
+PROCESSING = os.path.join(BASE, "processing")
 SEND_LOCK = os.path.join(BASE, "send.lock")
+LATENCY_LOG = os.path.join(os.path.expanduser("~"),
+                           "workspace/goals/muse/hidden_files/wechat-latency.jsonl")
 MEDIA = os.path.join(BASE, "media")
 QRFILE = os.path.join(BASE, "qr.json")
 QRPNG = os.path.join(BASE, "qr.png")
 SESSION_EXPIRED = -14
 CHUNK = 3500
 
-for d in (INBOX, OUTBOX, SENT, DONE, MEDIA):
+for d in (INBOX, OUTBOX, SENT, DONE, MEDIA, PROCESSING):
     os.makedirs(d, exist_ok=True)
 
 
@@ -476,8 +482,43 @@ def cmd_send():
         lock_fh.close()
 
 
+def _parts_ledger_path(fn):
+    """已发送分片账本：outbox/<fn>.parts.json，记录本任务已落地的分片。
+
+    2026-09-29 实测：图文回复里文字先发成功、图片上传抛异常时，整单会留在
+    outbox，下一次 wxbot.py send 从头重发，导致已落地的文字被重复发送
+    （一晚发了 3 遍）。账本让重试跳过已落地的分片，只补没发完的部分。
+    """
+    return os.path.join(OUTBOX, fn + ".parts.json")
+
+
+def _load_parts_ledger(fn):
+    try:
+        with open(_parts_ledger_path(fn)) as f:
+            return set(json.load(f))
+    except (OSError, ValueError):
+        return set()
+
+
+def _mark_part_done(fn, parts, pid):
+    parts.add(pid)
+    tmp = _parts_ledger_path(fn) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(parts), f)
+    os.replace(tmp, _parts_ledger_path(fn))
+
+
+def _clear_parts_ledger(fn):
+    try:
+        os.remove(_parts_ledger_path(fn))
+    except OSError:
+        pass
+
+
 def _cmd_send_locked(api, msg_cache):
-    files = sorted(f for f in os.listdir(OUTBOX) if f.endswith(".json"))
+    # 账本文件 *.parts.json 也以 .json 结尾，必须排除，否则会被当成待发任务
+    files = sorted(f for f in os.listdir(OUTBOX)
+                   if f.endswith(".json") and not f.endswith(".parts.json"))
     for fn in files:
         path = os.path.join(OUTBOX, fn)
         if _is_stale_ack(fn):
@@ -492,14 +533,20 @@ def _cmd_send_locked(api, msg_cache):
                 job = json.load(f)
             to, ctx, text = job["to"], job.get("context_token", ""), job.get("text", "")
             reply_parts = []  # 本次实际发出的内容，整单成功后一次性记入历史
+            parts_done = _load_parts_ledger(fn)  # 已落地的分片，重试时跳过
             chunks = split_text(text) or [""]
-            for ch in chunks:
+            for i, ch in enumerate(chunks):
+                pid = "text:%d" % i
+                if pid in parts_done:
+                    reply_parts.append(ch)  # 历史仍记全量
+                    continue
                 r = send_text_retry(api, to, ctx, ch, fn)
                 if not r or r.get("ret", 0) != 0:
                     print("SEND_FAIL", fn, r, flush=True)
                     break
                 cache_msg_text(msg_cache, _resp_msg_id(r), ch)
                 reply_parts.append(ch)
+                _mark_part_done(fn, parts_done, pid)
                 time.sleep(0.5)
             else:
                 img = job.get("image")
@@ -507,14 +554,16 @@ def _cmd_send_locked(api, msg_cache):
                     if not os.path.isfile(img):
                         print("SEND_FAIL", fn, "image not found:", img, flush=True)
                         continue
-                    up = upload_media_to_cdn(api, img, to, media_type=1)
-                    r = api.send_image_item(to, ctx, up["encrypt_query_param"],
-                                            up["aes_key_b64"], up["ciphertext_size"])
-                    check_send_response(r, fn)
-                    if r.get("ret", 0) != 0:
-                        print("SEND_FAIL", fn, "image:", r, flush=True)
-                        continue
-                    cache_msg_text(msg_cache, _resp_msg_id(r), "[图片]")
+                    if "image" not in parts_done:
+                        up = upload_media_to_cdn(api, img, to, media_type=1)
+                        r = api.send_image_item(to, ctx, up["encrypt_query_param"],
+                                                up["aes_key_b64"], up["ciphertext_size"])
+                        check_send_response(r, fn)
+                        if r.get("ret", 0) != 0:
+                            print("SEND_FAIL", fn, "image:", r, flush=True)
+                            continue
+                        cache_msg_text(msg_cache, _resp_msg_id(r), "[图片]")
+                        _mark_part_done(fn, parts_done, "image")
                     reply_parts.append("[图片]")
                     time.sleep(0.5)
                 vid = job.get("video")
@@ -522,14 +571,16 @@ def _cmd_send_locked(api, msg_cache):
                     if not os.path.isfile(vid):
                         print("SEND_FAIL", fn, "video not found:", vid, flush=True)
                         continue
-                    up = upload_media_to_cdn(api, vid, to, media_type=2)
-                    r = api.send_video_item(to, ctx, up["encrypt_query_param"],
-                                            up["aes_key_b64"], up["ciphertext_size"])
-                    check_send_response(r, fn)
-                    if r.get("ret", 0) != 0:
-                        print("SEND_FAIL", fn, "video:", r, flush=True)
-                        continue
-                    cache_msg_text(msg_cache, _resp_msg_id(r), "[视频]")
+                    if "video" not in parts_done:
+                        up = upload_media_to_cdn(api, vid, to, media_type=2)
+                        r = api.send_video_item(to, ctx, up["encrypt_query_param"],
+                                                up["aes_key_b64"], up["ciphertext_size"])
+                        check_send_response(r, fn)
+                        if r.get("ret", 0) != 0:
+                            print("SEND_FAIL", fn, "video:", r, flush=True)
+                            continue
+                        cache_msg_text(msg_cache, _resp_msg_id(r), "[视频]")
+                        _mark_part_done(fn, parts_done, "video")
                     reply_parts.append("[视频]")
                     time.sleep(0.5)
                 fpath = job.get("file")
@@ -537,16 +588,18 @@ def _cmd_send_locked(api, msg_cache):
                     if not os.path.isfile(fpath):
                         print("SEND_FAIL", fn, "file not found:", fpath, flush=True)
                         continue
-                    up = upload_media_to_cdn(api, fpath, to, media_type=3)
-                    r = api.send_file_item(to, ctx, up["encrypt_query_param"],
-                                           up["aes_key_b64"],
-                                           os.path.basename(fpath), up["raw_size"])
-                    check_send_response(r, fn)
-                    if r.get("ret", 0) != 0:
-                        print("SEND_FAIL", fn, "file:", r, flush=True)
-                        continue
-                    cache_msg_text(msg_cache, _resp_msg_id(r),
-                                   "[文件] " + os.path.basename(fpath))
+                    if "file" not in parts_done:
+                        up = upload_media_to_cdn(api, fpath, to, media_type=3)
+                        r = api.send_file_item(to, ctx, up["encrypt_query_param"],
+                                               up["aes_key_b64"],
+                                               os.path.basename(fpath), up["raw_size"])
+                        check_send_response(r, fn)
+                        if r.get("ret", 0) != 0:
+                            print("SEND_FAIL", fn, "file:", r, flush=True)
+                            continue
+                        cache_msg_text(msg_cache, _resp_msg_id(r),
+                                       "[文件] " + os.path.basename(fpath))
+                        _mark_part_done(fn, parts_done, "file")
                     reply_parts.append("[文件] " + os.path.basename(fpath))
                     time.sleep(0.5)
                 if os.path.exists(SEND_EXPIRED_MARKER):
@@ -554,10 +607,78 @@ def _cmd_send_locked(api, msg_cache):
                 append_history(to, "assistant",  # 会话历史：整单成功才记
                                "\n".join(p for p in reply_parts if p) or "[空回复]")
                 os.replace(path, os.path.join(SENT, fn))
+                _clear_parts_ledger(fn)
                 print("SENT", fn, flush=True)
                 continue
         except Exception as e:
             print("SEND_ERROR", fn, e, flush=True)
+
+
+def cmd_finish(msg_id):
+    """worker 单条命令收尾：发 outbox/<id>.json → processing→done → 写耗时打点。
+
+    前置：processing/<id>.json 已存在（hook 脚本认领时 mv 过来，并打了 claim_ts），
+    outbox/<id>.json 已由 worker 写好（含 to/context_token/text，可选 image/video/file）。
+    发送复用 cmd_send 的加锁整单逻辑（含分片账本/重试/历史记录/引用缓存）。
+    失败时 processing 留在原地，由 5 分钟兜底 cron 接手，绝不静默丢单。
+    """
+    import datetime
+    t0 = time.time()
+    proc_path = os.path.join(PROCESSING, msg_id + ".json")
+    out_path = os.path.join(OUTBOX, msg_id + ".json")
+    try:
+        with open(proc_path) as f:
+            proc = json.load(f)
+    except (OSError, ValueError):
+        # 幂等收尾：processing 已不在说明这单已处理完，残留的 outbox 是孤儿文件，
+        # 直接删掉防止被下次 sweep-send 误发造成重复
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except OSError:
+            pass
+        print("FINISH_FAIL", msg_id, "no processing file", flush=True)
+        return 1
+    claim_ts = proc.get("claim_ts") or t0
+    try:
+        with open(out_path) as f:
+            job = json.load(f)
+    except (OSError, ValueError):
+        print("FINISH_FAIL", msg_id, "no usable outbox file", flush=True)
+        return 1
+    out_mtime = os.path.getmtime(out_path)
+
+    cmd_send()  # 加锁发送 outbox（整单逻辑：分段/图片/账本/历史都在里面）
+
+    if not os.path.exists(os.path.join(SENT, msg_id + ".json")):
+        print("FINISH_FAIL", msg_id, "send incomplete, left for fallback",
+              flush=True)
+        return 1
+    try:
+        os.replace(proc_path, os.path.join(DONE, msg_id + ".json"))
+    except OSError as e:
+        print("FINISH_WARN", msg_id, "done move failed:", e, flush=True)
+    t_sent = time.time()
+    note = ("image" if job.get("image") else
+            "video" if job.get("video") else
+            "file" if job.get("file") else "纯文本")
+    entry = {
+        "ts": datetime.datetime.fromtimestamp(claim_ts).isoformat(),
+        "msg_id": msg_id,
+        "wake_to_claim_s": 0,
+        "claim_to_reply_s": round(out_mtime - claim_ts, 1),
+        "reply_to_sent_s": round(t_sent - out_mtime, 1),
+        "total_s": round(t_sent - claim_ts, 1),
+        "note": note,
+    }
+    try:
+        os.makedirs(os.path.dirname(LATENCY_LOG), exist_ok=True)
+        with open(LATENCY_LOG, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print("FINISH_WARN", msg_id, "latency log failed:", e, flush=True)
+    print("FINISH_OK", msg_id, "total=%.1fs" % entry["total_s"], flush=True)
+    return 0
 
 
 if __name__ == "__main__":
@@ -570,6 +691,11 @@ if __name__ == "__main__":
         cmd_receive(drain="--drain" in sys.argv)
     elif cmd == "send":
         cmd_send()
+    elif cmd == "finish":
+        if len(sys.argv) < 3:
+            print("usage: wxbot.py finish <msg_id>", flush=True)
+            sys.exit(1)
+        sys.exit(cmd_finish(sys.argv[2]))
     else:
-        print("usage: wxbot.py {qr|wait_login|receive [--drain]|send}")
+        print("usage: wxbot.py {qr|wait_login|receive [--drain]|send|finish <msg_id>}")
         sys.exit(1)

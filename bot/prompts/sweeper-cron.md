@@ -13,6 +13,6 @@
    - text 是 [视频] 或 [文件] 表示用户发了视频/文件：如实说你暂时看不了这类内容、请他用文字描述或截图，绝不编造内容。
    - text 开头是 [引用: ...] 表示用户引用了之前某条消息：方括号里的就是被引用的原文，直接针对它回答；如果是 [引用: 早些的消息] 说明没解析到原文，如实说你看不到他引用的是哪句、请他把那句话复述一遍，绝不编造被引用的内容，也绝不把内部技术细节（如缓存、message_id）说给用户听。
    - 用户要生图时，先读 skills/GPT电影感生图skill_巨物大片优化版.md 按规则扩写提示词，再用你自己的图片能力出图。
-   - 回复写成 outbox/<id>.json（{"to": from, "context_token": context_token, "text": 回复}，如有图片加 "image": 本地图片路径，要发视频加 "video": 本地视频路径，要发文件加 "file": 本地文件路径），运行 `wxbot.py send` 发出（文字按段落分段、图片/视频/文件上传都由它处理），把 processing/<id>.json 移到 done/。
+   - 回复写成 outbox/<id>.json（{"to": from, "context_token": context_token, "text": 回复}，如有图片加 "image": 本地图片路径，要发视频加 "video": 本地视频路径，要发文件加 "file": 本地文件路径），然后一条命令发完收尾：`/home/hatch/workspace/CowAgent/venv/bin/python wxbot.py finish <id>`（它负责发送、processing→done、写耗时打点；打印 FINISH_FAIL 则停手，processing 留给下次）。
 
 3. 若无事可做，安静结束，不打扰用户。

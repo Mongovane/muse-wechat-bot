@@ -73,3 +73,93 @@ cd ~/workspace/muse-auto-approve && node work/muse-rpc.cjs list 2>/dev/null | gr
 - 2026-09-29 17:31 实战：微信机器人访问全新域名，daemon 在 10 秒轮询内抓到
   pending，102ms 后自动 `allow_always` + `destination_domain`，`status: approved`。
   网页版全程无卡弹出。
+
+## 部署（新 Muse 上从零安装）
+
+本 skill 不带代码和依赖（node_modules 约 22MB），按以下步骤在新 Muse 上拉取安装。
+前置：Node.js ≥ 20（`node --version` 确认）。
+
+```bash
+# 1. 稀疏克隆：只取 MuseAutoApprove 子目录
+cd ~/workspace
+git clone --depth 1 --filter=blob:none --sparse https://github.com/bytehola/muse-guardian.git muse-auto-approve
+cd muse-auto-approve
+git sparse-checkout set MuseAutoApprove
+mv MuseAutoApprove/* . 2>/dev/null
+mv MuseAutoApprove/.[!.]* . 2>/dev/null
+rmdir MuseAutoApprove
+rm -f SKILL.md   # 仓库根的 skill 与本部署无关，不复活
+
+# 2. 装依赖
+npm install
+
+# 3. 建保活脚本 keepalive.sh（内容见本 skill 末尾附录），chmod +x
+
+# 4. 登录一次：要该 Muse 账号的 muse.ai 邮箱+密码，环境变量单次传入，不写盘
+MUSE_USER=邮箱 MUSE_PASSWORD=密码 node muse-daemon.cjs --smoke
+# 看到 smoke_ok 即成功，会话存入 data/cookies.json（30 天滚动，持续运行即永续）
+
+# 5. 启动 daemon（默认 --loop 10000 --always --fallback-once：
+#    每 10 秒轮询一次待审批单，新单自动 allow_always + destination_domain）
+setsid nohup node muse-daemon.cjs > log/daemon-stdout.log 2>&1 < /dev/null &
+
+# 6. 验证：让微信机器人访问一个全新域名
+tail -n 5 log/daemon-log.ndjson
+# 应出现 pending_found → decided(decision=allow_always)，网页版全程无卡弹出
+```
+
+7. 建保活 cron（用平台 cron 工具）：每 5 分钟执行
+   `bash ~/workspace/muse-auto-approve/keepalive.sh`，正常静默。
+   daemon 掉线时用已存会话自动重启；会话彻底过期时脚本写
+   `data/.needs-password` 不再空转，此时 24 小时内提醒用户一次要密码。
+
+密码规则：只在第 4 步用一次（环境变量），**从不写盘、不记记忆**。
+同一账号迁移时也可把旧机器的 `data/cookies.json` 安全拷过来（别走聊天明文），
+直接跳过第 4 步，但先停掉旧的 daemon，别两边同时跑。
+
+## 附录：keepalive.sh
+
+```bash
+#!/bin/bash
+# muse-auto-approve daemon 保活脚本：daemon 没跑就拉起来。
+# 靠 data/cookies.json 里的已存会话启动，不需要密码。
+# 会话过期则写 data/.needs-password 标记，不再空转重启。
+set -u
+DIR="$HOME/workspace/muse-auto-approve"
+PIDFILE="$DIR/data/muse-daemon.pid"
+NEEDPW="$DIR/data/.needs-password"
+STDOUTLOG="$DIR/log/daemon-stdout.log"
+cd "$DIR" || exit 1
+
+# 1) 还在跑？(pidfile 优先，pgrep 兜底；用 ^ 锚定避免匹配到自身)
+if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+  exit 0
+fi
+if pgrep -f "^node muse-daemon\.cjs" >/dev/null 2>&1; then
+  exit 0
+fi
+
+# 2) 已知缺密码（会话过期），不再尝试
+if [ -f "$NEEDPW" ]; then
+  echo "NEED_PASSWORD"
+  exit 2
+fi
+
+# 3) 尝试启动：无密码，靠 cookies.json 会话
+rm -f "$PIDFILE"
+nohup node muse-daemon.cjs >>"$STDOUTLOG" 2>&1 &
+NEWPID=$!
+sleep 3
+if kill -0 "$NEWPID" 2>/dev/null; then
+  echo "STARTED $NEWPID"
+  exit 0
+fi
+# 启动后立刻挂了，看原因
+if grep -q "NO_CREDENTIALS\|没有可用的登录凭据" "$STDOUTLOG" 2>/dev/null; then
+  date +%s > "$NEEDPW"
+  echo "NEED_PASSWORD"
+  exit 2
+fi
+echo "START_FAILED"
+exit 1
+```
