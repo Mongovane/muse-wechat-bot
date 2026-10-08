@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # watchdog: fast-fail for hook workers that never start.
-# If a claimed message's worker hasn't touched its .alive marker within 75s,
+# If a claimed message's worker hasn't touched its .alive marker within 30s,
 # the worker never started (runtime spawn failure) -> requeue to inbox/ for
 # another wake. Caps retries at 2, then leaves it for the cron fallback.
 # A worker that DID start (alive marker exists) is left alone even if slow.
+# 30s (was 75s): healthy worker startup is ~2s; 30s of silence means dead.
+# Stale-worker double-send is prevented by `wxbot.py finish <id> <claim_ts>`
+# ownership check (2026-10-04).
 set -uo pipefail
 
 BOT_DIR="${1:?bot dir required}"
 id="${2:?msg id required}"
 
-sleep 75
+sleep 30
 
 proc="$BOT_DIR/processing/$id.json"
 alive="$BOT_DIR/processing/$id.alive"

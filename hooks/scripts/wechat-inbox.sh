@@ -85,6 +85,48 @@ if [ -f "$BOT_DIR/.send_session_expired" ] && [ ! -f "$RELOGIN_FLAG" ]; then
   wake "微信发送侧登录态过期（send 返回 -14），需要用户重新扫码登录" '{"need_relogin":true}'
 fi
 
+# --- 1c. hook-side auto-finish: worker died after writing the reply? ---
+# 协议（2026-10-04）：worker 先写 outbox/<id>.json.tmp，写完 mv 成
+# outbox/<id>.json（原子发布，文件一出现就是完整的），每次写完都 touch
+# processing/<id>.alive 告诉看门狗"我还活着"。
+# 代发条件：outbox/<id>.json 存在（mtime > 5s，防没走协议的直接写）+
+# worker 已死（无 .alive，或 .alive 超过 30 秒没更新）。
+# claim_ts 归属校验 + 发送锁保证：即使 worker 还活着，也不会重发。
+# 尝试后 touch outbox 续命，失败时自然退避，不会 5 秒空转一次。
+# 另：outbox 有但 processing 没了 + sent/ 有记录 = 真孤儿（已发出），直接删，
+# 防以后被某次 wxbot.py send 误发。
+_now="$(date +%s)"
+# 顺手清理写了一半就没人管的 tmp（30 分钟前的）
+find "$BOT_DIR/outbox" -name '*.tmp' -mmin +30 -delete 2>/dev/null || true
+for _proc in "$BOT_DIR"/processing/*.json; do
+  [ -e "$_proc" ] || continue
+  _id="$(basename "$_proc" .json)"
+  _ob="$BOT_DIR/outbox/${_id}.json"
+  [ -f "$_ob" ] || continue
+  _ob_mtime="$(stat -c %Y "$_ob" 2>/dev/null || echo "$_now")"
+  _al="$BOT_DIR/processing/${_id}.alive"
+  _al_mtime="$(stat -c %Y "$_al" 2>/dev/null || echo 0)"
+  if [ "$((_now - _ob_mtime))" -gt 5 ] && { [ ! -f "$_al" ] || [ "$((_now - _al_mtime))" -gt 30 ]; }; then
+    _cts="$(jq -r '.claim_ts // ""' "$_proc" 2>/dev/null || true)"
+    if [ -n "$_cts" ]; then
+      log "hook auto-finish ${_id} (outbox $((_now - _ob_mtime))s, alive $((_now - _al_mtime))s)" '{}'
+      (cd "$BOT_DIR" && "$BOT_PYTHON" "$BOT_DIR/wxbot.py" finish "$_id" "$_cts" \
+        >>"$STATE_DIR/wechat-hook-finish.log" 2>&1 || true)
+      [ -f "$_ob" ] && touch "$_ob"  # 还在 = 没发出去，续命后下次再试
+    fi
+  fi
+done
+# 真孤儿清理：processing 没了、outbox 还在、sent/ 有记录（已发出）
+for _ob in "$BOT_DIR"/outbox/*.json; do
+  [ -e "$_ob" ] || continue
+  _id="$(basename "$_ob" .json)"
+  if [ ! -f "$BOT_DIR/processing/${_id}.json" ] && [ -f "$BOT_DIR/sent/${_id}.json" ]; then
+    log "hook cleanup orphan outbox ${_id} (already sent)" '{}'
+    rm -f "$_ob" "$BOT_DIR/outbox/${_id}.parts.json"
+  fi
+done
+unset _now _proc _id _ob _ob_mtime _al _al_mtime _cts
+
 # --- 2. inbox: claim in bash (atomic mv), start ack, then wake ---
 # 认领下沉到脚本：worker 不再自己 mv，省一次模型往返。
 # ack 阈值 30s = 冷启动 ~14s + 约 15s 工作时间；超时未写好回复才提示。
@@ -109,7 +151,7 @@ else
     if [ "$noack" != "true" ]; then
       setsid nohup bash "$BOT_DIR/ack_timer.sh" "$id" "$to" "$ctx" 30 >/dev/null 2>&1 < /dev/null &
     fi
-    # Fast-fail watchdog: requeue to inbox if the worker never starts (no .alive in 75s).
+    # Fast-fail watchdog: requeue to inbox if the worker never starts (no .alive in 30s).
     setsid nohup bash "$BOT_DIR/watchdog.sh" "$BOT_DIR" "$id" >/dev/null 2>&1 < /dev/null &
   done
   if [ "${#claimed[@]}" -eq 0 ]; then
@@ -118,16 +160,40 @@ else
     payload="$(python3 - "$BOT_DIR" "${claimed[@]}" <<'PYEOF'
 import json, os, sys
 bot, ids = sys.argv[1], sys.argv[2:]
+ACK_NOISE = "收到你的消息啦，我需要大约半分钟思考一下~"
 msgs = {}
+histories = {}
 for i in ids:
     try:
         d = json.load(open(os.path.join(bot, "processing", i + ".json")))
     except (OSError, ValueError):
         continue
-    msgs[i] = {"from": d.get("from"), "text": d.get("text", ""),
+    sender = d.get("from")
+    msgs[i] = {"from": sender, "text": d.get("text", ""),
                "image": d.get("image", ""),
-               "context_token": d.get("context_token")}
-print(json.dumps({"msg_ids": ids, "messages": msgs}, ensure_ascii=False))
+               "context_token": d.get("context_token"),
+               "claim_ts": d.get("claim_ts")}
+    # 上文直接塞进 payload：worker 冷启动免一次读文件，也免"没读上文"违规。
+    # 按发送方分组，最近 15 行，过滤掉延迟提示的噪音。
+    if sender and sender not in histories:
+        lines = []
+        try:
+            with open(os.path.join(bot, "history", sender + ".jsonl")) as f:
+                raw = f.readlines()[-15:]
+            for ln in raw:
+                try:
+                    e = json.loads(ln)
+                except ValueError:
+                    continue
+                t = str(e.get("text", ""))
+                if t.strip() == ACK_NOISE:
+                    continue
+                lines.append({"role": e.get("role"), "text": t[:300]})
+        except OSError:
+            pass
+        histories[sender] = lines
+print(json.dumps({"msg_ids": ids, "messages": msgs, "histories": histories},
+                 ensure_ascii=False))
 PYEOF
 )"
     wake "inbox has ${#claimed[@]} new message(s), claimed" "$payload"

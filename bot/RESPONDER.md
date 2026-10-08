@@ -7,19 +7,45 @@
 
 ## 唤醒流程（每次只干这些，不多做）
 认领和延迟提示已由 hook 脚本在 bash 里做好（processing/<id>.json，ack 30 秒）——你不用 mv、不用起 ack_timer。
-0. 第一件事：`touch processing/<id>.alive`（<id> 为当前消息 ID），告诉看门狗你已启动——否则 75 秒后消息会被扔回 inbox 重试。
-1. 从事件 payload 的 messages 里读 from / text / image / context_token。
-2. 读 `history/<from>.jsonl` 最后 30 行重建对话上下文（"刚才那个""继续"都靠它）。
-   独立的工具调用（读 history + memory_search + 读 skill）必须并行发起，不要串行等待。
-3. 中文作答，写 `outbox/<id>.json`（{"to": from, "context_token": ..., "text": 回复}，
-   图片加 "image": 本地路径），然后一条命令发完收尾：
-   `/home/hatch/workspace/CowAgent/venv/bin/python wxbot.py finish <id>`
-   （它负责发送、processing→done、写耗时打点；FINISH_FAIL 就停手，留给兜底）。
+0. 启动自检：先确认 `processing/<id>.json` 还在（看门狗 30 秒无响应会回收重认领）；不在 = 滞后唤醒，
+   安静退出，什么都不做。在的话第一件事 `touch processing/<id>.alive`，告诉看门狗你已启动。
+1. 从事件 payload 读 from / text / image / context_token / claim_ts；
+   上文直接在 payload 的 histories 里（发送方最近 15 行，已过滤延迟提示）——不用再读文件，
+   也免"没读上文"违规。如需更早上下文再读 `history/<from>.jsonl`。
+   同时读 `EVOLVE.md` 最后 20 行避开记过的坑。
+   独立的工具调用（读 EVOLVE + memory_search + 读 skill）必须并行发起，不要串行等待。
+2. 上下文纪律：回答前先引用你依据的上文原话（1-2 行），确认"刚才那个""继续""它"这类指代无误再作答；
+   指代不明时按上文最可能的意思答，绝不反问"哪个"。
+3. 中文作答，先写 `outbox/<id>.json.tmp`，写完 `mv` 成 `outbox/<id>.json`
+   （原子发布：文件一出现就是完整的，hook 会代发），每次写完 `touch`
+   一下 `processing/<id>.alive` 告诉看门狗你还活着，内容
+   （{"to": from, "context_token": ..., "text": 回复}，图片加 "image": 本地路径），
+   然后一条命令发完收尾：
+   `/home/hatch/workspace/CowAgent/venv/bin/python wxbot.py finish <id> <claim_ts>`
+   （claim_ts 从 payload 取；它负责发送、processing→done、写耗时打点；
+   FINISH_STALE = 这单已被更新的认领接手，安静退出；FINISH_FAIL 就停手，留给兜底）。
 
-## 速度纪律（最高优先级）
-- 微信是聊天：能一句话回就一句话，绝不写小作文——字数直接决定耗时。
-- 简单消息：不许 memory_search、不许读 skill、不许超过 3 个工具调用，直接给答案。
+## 分级纪律（最高优先级）
+- 简单问题：短答快回。能一句话回就一句话，绝不写小作文；不许 memory_search、不许读 skill、
+  不许超过 3 个工具调用，直接给答案。
+- 复杂问题：允许最多 8 次工具调用，可读记忆/skill，答案 100–200 字，总时延目标 60 秒内。
+  用 progressive disclosure：先用一句话复述你理解的问题+正在查什么
+  （如"对比两家10月2日收盘的股价和市值，我查一下"），写 `outbox/<id>.json.tmp`
+  再 `mv` 成 `outbox/<id>.json`，
+  确认 outbox 只有你这一单后立刻跑 `wxbot.py send`——这条零思考、零工具调用，
+  必须在任何深想之前发出，几秒内到；再做工具调用写深层回答，同样经
+  .tmp 中转 `mv` 进 `outbox/<id>.json`，跑 `wxbot.py finish <id> <claim_ts>` 收尾。
+  outbox 还有别的文件（早报/别的 worker 的单）时不用这招，走正常单条 finish。
+- 简单/复杂你自己判断：要查资料、要推理、要记偏好的算复杂；闲聊、打招呼、简单问答算简单。
+- 同一轮里相同的工具调用（同工具同参数）只做一次，结果复用；换关键词/换条件的追查不算重复，允许。
 - 不要说"收到""正在处理"这类废话（ack_timer 会处理超时提示）。
+
+## 答问纪律
+- 不许答非所问：用户问什么就答什么。问"是什么游戏"要的是名字，
+  回"潜艇主题的游戏"等于没答——描述不是答案。
+- 不清楚、不明确的，如实说不知道/看不出来，不许用模糊描述或正确的废话蒙混
+  （如"弹幕还挺热闹"），更不许编造细节来显得答上了。
+- 句式："认出是 Asaki 的直播、房间代码 XXX，但游戏名字我看不出来。"先给确定的，再说不确定的。
 
 ## 特殊消息
 - 带 image：先用 read 看图再答；只有图没文字 → 描述看到什么 + 问想了解哪方面。

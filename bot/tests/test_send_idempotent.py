@@ -76,19 +76,18 @@ def test_retry_skips_delivered_text():
     wxbot.upload_media_to_cdn = fake_upload
     api = FakeApi()
 
-    # 第 1 次：文字成功，上传抛异常 → 任务留在 outbox
+    # 第 1 次：文字成功，上传抛异常（瞬时故障）→ 任务级重试，第 2 次上传成功
+    # 整单在同一次 _cmd_send_locked 内发出；文字仍只发一次（账本防重）
     wxbot._cmd_send_locked(api, {})
     assert len(api.text_calls) == 1, api.text_calls
-    assert not os.path.exists(os.path.join(sent, "t1.json"))
-    assert os.path.exists(os.path.join(outbox, "t1.json.parts.json"))
+    assert os.path.exists(os.path.join(sent, "t1.json")), "重试后应已发出"
+    assert not os.path.exists(os.path.join(outbox, "t1.json.parts.json")), \
+        "账本应清理"
 
-    # 第 2 次（重试）：文字必须跳过，只发图片
+    # 再跑一次 send：已归档的任务不再处理
     wxbot._cmd_send_locked(api, {})
     assert len(api.text_calls) == 1, "文字被重复发送: %r" % api.text_calls
     assert len(api.image_calls) == 1, api.image_calls
-    assert os.path.exists(os.path.join(sent, "t1.json"))
-    assert not os.path.exists(os.path.join(outbox, "t1.json.parts.json")), \
-        "账本未清理"
 
     # 历史记了一条完整回复（含图片标记）
     lines = open(os.path.join(hist, "u1.jsonl")).read().strip().split("\n")

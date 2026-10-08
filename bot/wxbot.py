@@ -515,6 +515,10 @@ def _clear_parts_ledger(fn):
         pass
 
 
+SEND_RETRY_ATTEMPTS = 3           # 任务级重试次数（含首次）
+SEND_RETRY_BACKOFF = (5, 15, 30)  # 每次瞬时失败后的等待秒数，指数退避
+
+
 def _cmd_send_locked(api, msg_cache):
     # 账本文件 *.parts.json 也以 .json 结尾，必须排除，否则会被当成待发任务
     files = sorted(f for f in os.listdir(OUTBOX)
@@ -528,99 +532,135 @@ def _cmd_send_locked(api, msg_cache):
                 pass
             print("SENT_SKIP_STALE_ACK", fn, flush=True)
             continue
-        try:
-            with open(path) as f:
-                job = json.load(f)
-            to, ctx, text = job["to"], job.get("context_token", ""), job.get("text", "")
-            reply_parts = []  # 本次实际发出的内容，整单成功后一次性记入历史
-            parts_done = _load_parts_ledger(fn)  # 已落地的分片，重试时跳过
-            chunks = split_text(text) or [""]
-            for i, ch in enumerate(chunks):
-                pid = "text:%d" % i
-                if pid in parts_done:
-                    reply_parts.append(ch)  # 历史仍记全量
-                    continue
-                r = send_text_retry(api, to, ctx, ch, fn)
-                if not r or r.get("ret", 0) != 0:
-                    print("SEND_FAIL", fn, r, flush=True)
-                    break
-                cache_msg_text(msg_cache, _resp_msg_id(r), ch)
-                reply_parts.append(ch)
-                _mark_part_done(fn, parts_done, pid)
-                time.sleep(0.5)
-            else:
-                img = job.get("image")
-                if img:
-                    if not os.path.isfile(img):
-                        print("SEND_FAIL", fn, "image not found:", img, flush=True)
-                        continue
-                    if "image" not in parts_done:
-                        up = upload_media_to_cdn(api, img, to, media_type=1)
-                        r = api.send_image_item(to, ctx, up["encrypt_query_param"],
-                                                up["aes_key_b64"], up["ciphertext_size"])
-                        check_send_response(r, fn)
-                        if r.get("ret", 0) != 0:
-                            print("SEND_FAIL", fn, "image:", r, flush=True)
-                            continue
-                        cache_msg_text(msg_cache, _resp_msg_id(r), "[图片]")
-                        _mark_part_done(fn, parts_done, "image")
-                    reply_parts.append("[图片]")
-                    time.sleep(0.5)
-                vid = job.get("video")
-                if vid:
-                    if not os.path.isfile(vid):
-                        print("SEND_FAIL", fn, "video not found:", vid, flush=True)
-                        continue
-                    if "video" not in parts_done:
-                        up = upload_media_to_cdn(api, vid, to, media_type=2)
-                        r = api.send_video_item(to, ctx, up["encrypt_query_param"],
-                                                up["aes_key_b64"], up["ciphertext_size"])
-                        check_send_response(r, fn)
-                        if r.get("ret", 0) != 0:
-                            print("SEND_FAIL", fn, "video:", r, flush=True)
-                            continue
-                        cache_msg_text(msg_cache, _resp_msg_id(r), "[视频]")
-                        _mark_part_done(fn, parts_done, "video")
-                    reply_parts.append("[视频]")
-                    time.sleep(0.5)
-                fpath = job.get("file")
-                if fpath:
-                    if not os.path.isfile(fpath):
-                        print("SEND_FAIL", fn, "file not found:", fpath, flush=True)
-                        continue
-                    if "file" not in parts_done:
-                        up = upload_media_to_cdn(api, fpath, to, media_type=3)
-                        r = api.send_file_item(to, ctx, up["encrypt_query_param"],
-                                               up["aes_key_b64"],
-                                               os.path.basename(fpath), up["raw_size"])
-                        check_send_response(r, fn)
-                        if r.get("ret", 0) != 0:
-                            print("SEND_FAIL", fn, "file:", r, flush=True)
-                            continue
-                        cache_msg_text(msg_cache, _resp_msg_id(r),
-                                       "[文件] " + os.path.basename(fpath))
-                        _mark_part_done(fn, parts_done, "file")
-                    reply_parts.append("[文件] " + os.path.basename(fpath))
-                    time.sleep(0.5)
-                if os.path.exists(SEND_EXPIRED_MARKER):
-                    os.remove(SEND_EXPIRED_MARKER)
-                append_history(to, "assistant",  # 会话历史：整单成功才记
-                               "\n".join(p for p in reply_parts if p) or "[空回复]")
-                os.replace(path, os.path.join(SENT, fn))
-                _clear_parts_ledger(fn)
-                print("SENT", fn, flush=True)
+        # 任务级重试：瞬时故障（ret=-2 服务端拒绝、请求异常）退避重试；
+        # 永久性失败（参数错、文件缺失、登录过期）不重试，文件留给人工/下一轮。
+        # （2026-10-08 Peter 要求：失败时自动重新拉起发送，不再只靠 3 分钟兜底轮询）
+        for attempt in range(SEND_RETRY_ATTEMPTS):
+            ok, transient = _send_one_file(api, msg_cache, fn, path)
+            if ok or not transient:
+                break
+            if attempt + 1 < SEND_RETRY_ATTEMPTS:
+                wait = SEND_RETRY_BACKOFF[
+                    min(attempt, len(SEND_RETRY_BACKOFF) - 1)]
+                print("SEND_RETRY", fn,
+                      "attempt %d/%d in %ds"
+                      % (attempt + 2, SEND_RETRY_ATTEMPTS, wait), flush=True)
+                time.sleep(wait)
+
+
+def _is_transient_send_fail(resp):
+    """判断发送失败是否值得重试。
+
+    ret=-2 prepare failed 是服务端瞬时拒绝（2026-10-07/08 实测持续约
+    15.5 小时后自行恢复），resp 为 None 是请求异常（断连/超时），都可重试。
+    -14 登录过期、-3 参数错误、文件缺失等是永久性失败，重试无意义。"""
+    if resp is None:
+        return True
+    return resp.get("ret") == -2
+
+
+def _send_one_file(api, msg_cache, fn, path):
+    """发送单个 outbox 任务。返回 (ok, transient)：
+    ok=True 整单成功；ok=False 且 transient=True 是瞬时故障、可重试；
+    transient=False 是永久性失败，重试也发不出去。"""
+    try:
+        with open(path) as f:
+            job = json.load(f)
+        to, ctx, text = job["to"], job.get("context_token", ""), job.get("text", "")
+        reply_parts = []  # 本次实际发出的内容，整单成功后一次性记入历史
+        parts_done = _load_parts_ledger(fn)  # 已落地的分片，重试时跳过
+        chunks = split_text(text) or [""]
+        for i, ch in enumerate(chunks):
+            pid = "text:%d" % i
+            if pid in parts_done:
+                reply_parts.append(ch)  # 历史仍记全量
                 continue
-        except Exception as e:
-            print("SEND_ERROR", fn, e, flush=True)
+            r = send_text_retry(api, to, ctx, ch, fn)
+            if not r or r.get("ret", 0) != 0:
+                print("SEND_FAIL", fn, r, flush=True)
+                return False, _is_transient_send_fail(r)
+            cache_msg_text(msg_cache, _resp_msg_id(r), ch)
+            reply_parts.append(ch)
+            _mark_part_done(fn, parts_done, pid)
+            time.sleep(0.5)
+        img = job.get("image")
+        if img:
+            if not os.path.isfile(img):
+                print("SEND_FAIL", fn, "image not found:", img, flush=True)
+                return False, False
+            if "image" not in parts_done:
+                up = upload_media_to_cdn(api, img, to, media_type=1)
+                r = api.send_image_item(to, ctx, up["encrypt_query_param"],
+                                        up["aes_key_b64"], up["ciphertext_size"])
+                check_send_response(r, fn)
+                if r.get("ret", 0) != 0:
+                    print("SEND_FAIL", fn, "image:", r, flush=True)
+                    return False, _is_transient_send_fail(r)
+                cache_msg_text(msg_cache, _resp_msg_id(r), "[图片]")
+                _mark_part_done(fn, parts_done, "image")
+            reply_parts.append("[图片]")
+            time.sleep(0.5)
+        vid = job.get("video")
+        if vid:
+            if not os.path.isfile(vid):
+                print("SEND_FAIL", fn, "video not found:", vid, flush=True)
+                return False, False
+            if "video" not in parts_done:
+                up = upload_media_to_cdn(api, vid, to, media_type=2)
+                r = api.send_video_item(to, ctx, up["encrypt_query_param"],
+                                        up["aes_key_b64"], up["ciphertext_size"])
+                check_send_response(r, fn)
+                if r.get("ret", 0) != 0:
+                    print("SEND_FAIL", fn, "video:", r, flush=True)
+                    return False, _is_transient_send_fail(r)
+                cache_msg_text(msg_cache, _resp_msg_id(r), "[视频]")
+                _mark_part_done(fn, parts_done, "video")
+            reply_parts.append("[视频]")
+            time.sleep(0.5)
+        fpath = job.get("file")
+        if fpath:
+            if not os.path.isfile(fpath):
+                print("SEND_FAIL", fn, "file not found:", fpath, flush=True)
+                return False, False
+            if "file" not in parts_done:
+                up = upload_media_to_cdn(api, fpath, to, media_type=3)
+                r = api.send_file_item(to, ctx, up["encrypt_query_param"],
+                                       up["aes_key_b64"],
+                                       os.path.basename(fpath), up["raw_size"])
+                check_send_response(r, fn)
+                if r.get("ret", 0) != 0:
+                    print("SEND_FAIL", fn, "file:", r, flush=True)
+                    return False, _is_transient_send_fail(r)
+                cache_msg_text(msg_cache, _resp_msg_id(r),
+                               "[文件] " + os.path.basename(fpath))
+                _mark_part_done(fn, parts_done, "file")
+            reply_parts.append("[文件] " + os.path.basename(fpath))
+            time.sleep(0.5)
+        if os.path.exists(SEND_EXPIRED_MARKER):
+            os.remove(SEND_EXPIRED_MARKER)
+        append_history(to, "assistant",  # 会话历史：整单成功才记
+                       "\n".join(p for p in reply_parts if p) or "[空回复]")
+        os.replace(path, os.path.join(SENT, fn))
+        _clear_parts_ledger(fn)
+        print("SENT", fn, flush=True)
+        return True, False
+    except Exception as e:
+        print("SEND_ERROR", fn, e, flush=True)
+        return False, True
 
 
-def cmd_finish(msg_id):
+def cmd_finish(msg_id, expected_claim_ts=None):
     """worker 单条命令收尾：发 outbox/<id>.json → processing→done → 写耗时打点。
 
     前置：processing/<id>.json 已存在（hook 脚本认领时 mv 过来，并打了 claim_ts），
     outbox/<id>.json 已由 worker 写好（含 to/context_token/text，可选 image/video/file）。
     发送复用 cmd_send 的加锁整单逻辑（含分片账本/重试/历史记录/引用缓存）。
     失败时 processing 留在原地，由 5 分钟兜底 cron 接手，绝不静默丢单。
+
+    expected_claim_ts（可选）：worker 从唤醒 payload 里拿到的 claim_ts。
+    看门狗超时回收后 hook 会重新认领并改写 claim_ts；此时旧 worker 已是过时认领，
+    必须拒发（FINISH_STALE，安静退出），否则会和新 worker 重复回复。
+    （2026-10-04：watchdog 75s→30s 后加此校验，防止慢启动 worker 误判导致重发）
     """
     import datetime
     t0 = time.time()
@@ -630,16 +670,42 @@ def cmd_finish(msg_id):
         with open(proc_path) as f:
             proc = json.load(f)
     except (OSError, ValueError):
-        # 幂等收尾：processing 已不在说明这单已处理完，残留的 outbox 是孤儿文件，
-        # 直接删掉防止被下次 sweep-send 误发造成重复
+        if expected_claim_ts is not None:
+            # 归属校验模式：processing 已不在（被看门狗回收/被新 worker 接手/已归档），
+            # 本轮是过时或滞后唤醒，安静退出，绝不重发。
+            print("FINISH_STALE", msg_id, "no processing file, standing down",
+                  flush=True)
+            return 0
+        # 幂等收尾：processing 已不在。残留的 outbox 只有在已发送（sent/ 有记录）
+        # 时才是真孤儿、可以删；否则这单从未发出（例如早报 outbox 由 daily cron
+        # 直接写、从不经过 processing），删掉会静默丢单，必须保留待重试。
+        # （2026-10-04 实测：旧逻辑删掉了未发出的早报 outbox）
         try:
             if os.path.exists(out_path):
-                os.remove(out_path)
+                if os.path.exists(os.path.join(SENT, msg_id + ".json")):
+                    os.remove(out_path)
+                    print("FINISH_FAIL", msg_id,
+                          "no processing file, orphan outbox removed (already sent)",
+                          flush=True)
+                else:
+                    print("FINISH_FAIL", msg_id,
+                          "no processing file, outbox kept for retry (never sent)",
+                          flush=True)
+                return 1
         except OSError:
             pass
         print("FINISH_FAIL", msg_id, "no processing file", flush=True)
         return 1
     claim_ts = proc.get("claim_ts") or t0
+    if expected_claim_ts is not None:
+        actual_claim = proc.get("claim_ts")
+        if actual_claim is not None and str(actual_claim) != str(expected_claim_ts):
+            # 过时认领：看门狗已回收并改写 claim_ts，新 worker 拥有这单。
+            # 拒发并安静退出；残留 outbox 留给新 worker 覆盖或兜底处理，绝不擅自删除。
+            print("FINISH_STALE", msg_id,
+                  "claim_ts mismatch (expected %s, have %s), owned by newer claim; standing down"
+                  % (expected_claim_ts, actual_claim), flush=True)
+            return 0
     try:
         with open(out_path) as f:
             job = json.load(f)
@@ -698,9 +764,9 @@ if __name__ == "__main__":
         cmd_send()
     elif cmd == "finish":
         if len(sys.argv) < 3:
-            print("usage: wxbot.py finish <msg_id>", flush=True)
+            print("usage: wxbot.py finish <msg_id> [expected_claim_ts]", flush=True)
             sys.exit(1)
-        sys.exit(cmd_finish(sys.argv[2]))
+        sys.exit(cmd_finish(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None))
     else:
-        print("usage: wxbot.py {qr|wait_login|receive [--drain]|send|finish <msg_id>}")
+        print("usage: wxbot.py {qr|wait_login|receive [--drain]|send|finish <msg_id> [expected_claim_ts]}")
         sys.exit(1)
