@@ -7,7 +7,7 @@
 │  微信    │◀──────────────▶│ wxbot.py │──────────▶│ inbox/  │
 │ (ilink)  │  getUpdates     │ receive  │  <msg_id>.json     └────┬────┘
 └─────────┘                └──────────┘                          │
-       ▲                                                         │ 每 10s 扫描
+       ▲                                                         │ 每 5s 扫描
        │ send_text / send_image_item                             ▼
        │                                                ┌──────────────┐
 ┌──────────┐  发 outbox     ┌──────────┐  wake      │ wechat-inbox │
@@ -18,7 +18,7 @@
 
 ## 消息流（一句话）
 
-微信 → 长轮询 → `inbox/<msg_id>.json` → hook 10 秒内发现并唤醒 worker →
+微信 → 长轮询 → `inbox/<msg_id>.json` → hook 5 秒内发现并唤醒 worker →
 worker 用 `mv` 原子认领到 `processing/` → Muse 中文作答（按需调 skill）→
 `outbox/<msg_id>.json` → `wxbot.py send` 发出（含图片上传）→ 归档到 `done/`。
 
@@ -39,13 +39,16 @@ worker 用 `mv` 原子认领到 `processing/` → Muse 中文作答（按需调 
 
 最早是每分钟 cron 轮询：消息来了平均干等 30 秒才被发现。现在：
 
-- **hook**（`bot/hook/wechat-inbox.sh`，每 10 秒）：纯 bash，零 agent 成本。发现新文件立刻 `wake`，只在有事时才起 worker。
+- **hook**（`hooks/scripts/wechat-inbox.sh`，每 5 秒）：纯 bash，零 agent 成本。发现新文件立刻 `wake`，只在有事时才起 worker。
 - **看门狗下沉**：原来每分钟起一个 agent 只为了 `pgrep` 看进程，现在 hook 脚本顺手做：挂了 `setsid nohup` 拉起；`SESSION_EXPIRED` 才唤醒通知用户重扫（state flag 防重复）。
-- **兜底 cron**（5 分钟）：只处理漏网——超过 3 分钟没人认领的 inbox 文件、超过 10 分钟卡在 processing 的文件（打回 inbox 重认领）。
+- **兜底门控 hook**（每 180 秒）：只处理漏网——门控脚本在 bash 内做看门狗；
+  只在超过 2 分钟没人认领的 inbox 文件、processing 超时（无 `.alive` 4 分钟 /
+  有 `.alive` 10 分钟）、登录态过期时唤醒 worker。兜底不是 agent cron
+  （cron 每轮必起 agent，空轮也烧额度）。
 
 ## 防重复：原子认领
 
-hook worker 和兜底 cron 可能同时看到同一个文件。规则只有一条：
+hook worker 和兜底 worker 可能同时看到同一个文件。规则只有一条：
 
 > 先 `mv inbox/<id>.json processing/<id>.json`，mv 失败（文件已不在）就跳过。
 

@@ -25,6 +25,13 @@ def load_wxbot(tmp):
         setattr(mod, name, p)
     mod.SEND_LOCK = os.path.join(tmp, "send.lock")
     mod.LATENCY_LOG = os.path.join(tmp, "wechat-latency.jsonl")
+    # 全部可写路径指向 tmp：测试绝不碰生产文件（2026-10-16 教训见
+    # test_send_idempotent.py）。
+    mod.HISTORY_DIR = os.path.join(tmp, "history")
+    mod.MSGCACHE = os.path.join(tmp, "msg_cache.json")
+    mod.QUOTA_FILE = os.path.join(tmp, "quota.json")
+    mod.SHARED_POOL = os.path.join(tmp, "pushed-shared.json")
+    os.makedirs(mod.HISTORY_DIR, exist_ok=True)
     return mod
 
 
@@ -96,7 +103,7 @@ def test_finish_success_moves_done_and_logs(tmp_path=None):
 
     real_cmd_send = wxbot.cmd_send
 
-    def fake_send():
+    def fake_send(only=None):
         # 模拟发送成功：outbox→sent（跳过真实网络）
         os.replace(os.path.join(wxbot.OUTBOX, mid + ".json"),
                    os.path.join(wxbot.SENT, mid + ".json"))
@@ -118,7 +125,7 @@ def test_finish_success_moves_done_and_logs(tmp_path=None):
 
 def _fake_send_ok(wxbot, mid):
     """返回一个 mock 的 cmd_send：模拟发送成功（outbox→sent）。"""
-    def fake_send():
+    def fake_send(only=None):
         os.replace(os.path.join(wxbot.OUTBOX, mid + ".json"),
                    os.path.join(wxbot.SENT, mid + ".json"))
     return fake_send
@@ -137,7 +144,7 @@ def test_finish_stale_claim_mismatch_stands_down():
 
     sent_calls = []
     real_cmd_send = wxbot.cmd_send
-    wxbot.cmd_send = lambda: sent_calls.append(1)
+    wxbot.cmd_send = lambda only=None: sent_calls.append(1)
     try:
         rc = wxbot.cmd_finish(mid, "1000")
     finally:
@@ -158,7 +165,7 @@ def test_finish_stale_no_processing_stands_down():
                {"to": "u", "text": "late reply"})
     sent_calls = []
     real_cmd_send = wxbot.cmd_send
-    wxbot.cmd_send = lambda: sent_calls.append(1)
+    wxbot.cmd_send = lambda only=None: sent_calls.append(1)
     try:
         rc = wxbot.cmd_finish(mid, "1000")
     finally:

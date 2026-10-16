@@ -44,6 +44,12 @@ def make_env(wxbot):
     wxbot.OUTBOX = outbox
     wxbot.SENT = sent
     wxbot.HISTORY_DIR = hist
+    # 全部可写路径指向 tmp：测试绝不碰生产文件（2026-10-16 教训：
+    # 缺 override 的测试把 test 条目写进真实 msg_cache、把生产 quota 账本
+    # 从 4 顶到 10、还在生产 history/ 下建了 u1.jsonl）。
+    wxbot.MSGCACHE = os.path.join(tmp, "msg_cache.json")
+    wxbot.QUOTA_FILE = os.path.join(tmp, "quota.json")
+    wxbot.SHARED_POOL = os.path.join(tmp, "pushed-shared.json")
     wxbot.time.sleep = lambda s: None  # 测试加速
     return tmp, outbox, sent, hist
 
@@ -119,9 +125,9 @@ def test_chunk_resume():
     fail = {"n": 0}
 
     def flaky_send(to, txt, ctx):
-        if txt == "c1" and fail["n"] < 2:
+        if txt == "c1" and fail["n"] < 1:
             fail["n"] += 1
-            return {"ret": 500}  # 内部重试也失败，整单中断
+            return {"ret": 500}  # 第一次失败，整单中断
         return orig_send(to, txt, ctx)
 
     api.send_text = flaky_send

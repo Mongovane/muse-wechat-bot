@@ -6,7 +6,7 @@
 
 - 📩 **微信收发**：扫码登录个人微信，实时接收消息、自动回复（含图片）
 - 🧠 **Muse 亲自作答**：每条消息都由 Muse 回复，长期记忆保留在 `$HOME`
-- ⚡ **事件驱动**：收件箱一来新消息 10 秒内唤醒回答，不用傻等轮询
+- ⚡ **事件驱动**：收件箱一来新消息 5 秒内唤醒回答，不用傻等轮询
 - 🛠️ **Skill 系统**：天气、热搜、每日新闻、小工具、基金、百科、电影感生图提示词……按场景自动调用
 - 🔍 **联网搜索**：集成 `grok-search`，可精读网页全文、发现站点页面
 - 🛡️ **防重复**：`mv` 原子认领，hook 和兜底任务同时跑也不会 double 回复
@@ -16,14 +16,14 @@
 ```
 微信 ──iLink 长轮询──▶ wxbot.py receive ──▶ inbox/<msg_id>.json
                                                 │
-                    wechat-inbox hook (10s) ────┘ 发现新文件 → 唤醒 worker
+                    wechat-inbox hook (5s) ────┘ 发现新文件 → 唤醒 worker
                                                 │
                           worker: 认领(mv→processing/) → Muse 作答
                                 → outbox/<msg_id>.json → wxbot.py send → 微信
                                 → processing/ → done/
 ```
 
-看门狗下沉在 hook 的 bash 脚本里：接收器挂了直接拉起；只有微信服务端作废登录态（`SESSION_EXPIRED`）时才需要重新扫码。另有一个 5 分钟的兜底 cron，只捡漏。
+看门狗下沉在 hook 的 bash 脚本里：接收器挂了直接拉起；只有微信服务端作废登录态（`SESSION_EXPIRED`）时才需要重新扫码。另有兜底门控 hook（每 180 秒），只捡漏。
 
 ## 快速开始
 
@@ -32,8 +32,8 @@
 1. 克隆 CowAgent，建 venv 装依赖
 2. 复制 `bot/wxbot.py`，`qr` → 扫码 → `wait_login` 登录
 3. 启动 `receive` 接收器
-4. 安装 `bot/hook/wechat-inbox.sh` 并创建 hook（worker 指令见 `bot/prompts/hook-worker.md`）
-5. 创建 5 分钟兜底 cron（指令见 `bot/prompts/sweeper-cron.md`）
+4. 安装 `hooks/scripts/wechat-inbox.sh` 并创建 hook（worker 指令见 `bot/prompts/hook-worker.md`）
+5. 创建兜底门控 hook（脚本见 `hooks/scripts/wechat-sweeper-gate.sh`，worker 指令见 `bot/prompts/sweeper-gate-worker.md`）
 6. 复制 `skills/`，微信里发条消息测试
 
 ## 仓库结构
@@ -41,12 +41,21 @@
 ```
 ├── SKILL.md                # 给另一个 Muse 对话用的 skill 说明（直接加载即可）
 ├── bot/
-│   ├── wxbot.py            # 收发主程序：qr / wait_login / receive / send
-│   ├── hook/
-│   │   └── wechat-inbox.sh # 事件驱动脚本：看门狗 + 收件箱监听
-│   └── prompts/
-│       ├── hook-worker.md  # hook 唤醒的 worker 指令
-│       └── sweeper-cron.md # 兜底 cron 指令
+│   ├── wxbot.py            # 收发主程序：qr / wait_login / receive / send / finish
+│   ├── RESPONDER.md        # 回复规范（worker 指令引用）
+│   ├── EVOLVE.md           # 作答纪律演进记录
+│   ├── ack_timer.sh        # 延迟提示（微信无“对方正在输入”）
+│   ├── watchdog.sh         # 看门狗回收（worker 未启动时打回 inbox）
+│   ├── prompts/
+│   │   ├── hook-worker.md  # hook 唤醒的 worker 指令
+│   │   └── sweeper-gate-worker.md # 兜底门控唤醒的 worker 指令
+│   └── tests/              # 回归测试（pytest）
+├── hooks/
+│   └── scripts/
+│       ├── wechat-inbox.sh # 事件驱动脚本：看门狗 + 收件箱监听（5 秒）
+│       └── wechat-sweeper-gate.sh # 兜底门控：bash 看门狗 + 漏网唤醒（180 秒）
+├── crons/
+│   └── README.md           # 说明：兜底已改为 hook 门控，不再有 agent cron
 ├── docs/
 │   ├── setup.md            # 一步步搭建
 │   ├── architecture.md     # 架构与消息流详解

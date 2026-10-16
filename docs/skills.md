@@ -1,6 +1,6 @@
 # Skill 系统
 
-worker（hook 唤醒 / 兜底 cron）回答问题时，按下表先读对应 skill 文档再执行。
+worker（hook 唤醒 / 兜底门控唤醒）回答问题时，按下表先读对应 skill 文档再执行。
 映射关系同时写在 `bot/prompts/` 的两份 prompt 里，加新 skill 时三处同步。
 
 ## 内置 skill 一览
@@ -48,12 +48,12 @@ worker（hook 唤醒 / 兜底 cron）回答问题时，按下表先读对应 ski
 常驻 daemon（`~/workspace/muse-auto-approve`）每 10 秒轮询并自动 `allow_always`
 永久放行。这是运维文档，不是问答 skill——只有当用户问起"审批""自动放行""新域名"
 相关问题，或报障"又有卡弹出来了"时，worker 才读它做状态检查与排障。
-部署细节（保活 cron、密码规则）见文档正文。
+部署细节（保活门控、密码规则）见文档正文。
 
 ## 加一个新 skill（三步）
 
 1. 把 skill 说明（.md）丢进 `skills/`
-2. 在 `bot/prompts/hook-worker.md` 和 `bot/prompts/sweeper-cron.md` 的映射表里加一行："用户问 X → 先读 skills/xxx.md"
+2. 在 `bot/prompts/hook-worker.md` 和 `bot/prompts/sweeper-gate-worker.md` 的映射表里加一行："用户问 X → 先读 skills/xxx.md"
 3. 微信里实测一条真实问题，确认链路通
 
 如果是需要 key 的第三方 skill：key 走 Muse 的 Secure Vault / 环境变量，**绝不**写进仓库和 prompt。

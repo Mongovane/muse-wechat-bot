@@ -9,13 +9,16 @@ Subcommands:
   wait_login  Poll QR status until confirmed/expired/timeout -> credentials.json
   receive     Daemon: long-poll getUpdates -> inbox/<msg_id>.json
               (text, server-transcribed voice, images downloaded from CDN)
-  send        Send all outbox/*.json -> sent/
-              (text chunked, optional "image"/"video"/"file" local paths)
-  finish      Worker one-shot: send outbox/<id>.json, move processing/<id>.json
-              -> done/, append latency entry. FINISH_FAIL leaves processing/
-              for the 5-min fallback sweeper.
+  send        Send outbox/*.json -> sent/ (all files; explicit full send).
+              Use cmd_send(only=<fn>) to send exactly one file.
+  finish      Worker one-shot: send ONLY outbox/<id>.json, move
+              processing/<id>.json -> done/, append latency entry.
+              FINISH_FAIL leaves processing/ for the 5-min fallback sweeper.
+              finish must never flush other outbox files (2026-10-16:
+              full-send-in-finish leaked flash/briefing/cards into replies).
 """
 import sys, os, json, time, uuid, re, fcntl
+import datetime
 
 sys.path.insert(0, os.environ.get("COWAGENT_HOME", "/home/hatch/workspace/CowAgent"))
 from channel.weixin.weixin_api import (  # noqa: E402
@@ -34,11 +37,22 @@ PROCESSING = os.path.join(BASE, "processing")
 SEND_LOCK = os.path.join(BASE, "send.lock")
 LATENCY_LOG = os.path.join(os.path.expanduser("~"),
                            "workspace/goals/muse/hidden_files/wechat-latency.jsonl")
+SHARED_POOL = os.path.join(os.path.expanduser("~"),
+                           "workspace/goals/muse/hidden_files/pushed-shared.json")
 MEDIA = os.path.join(BASE, "media")
 QRFILE = os.path.join(BASE, "qr.json")
 QRPNG = os.path.join(BASE, "qr.png")
 SESSION_EXPIRED = -14
 CHUNK = 3500
+# ilink 回复配额：每条用户入站后 bot 最多发约 10 条，第 11 条起 ret=-2
+# （2026-10-08 全网调研确认：Thysrael/Horizon PR#159、clawock、腾讯维护者亲口确认）。
+# 本地账本：proactive 发送按优先级排队，ack 在配额 >=5 时跳过。
+QUOTA_FILE = os.path.join(BASE, "quota.json")
+QUOTA_MAX = 10
+QUOTA_ACK_LIMIT = 5
+# proactive 优先级 → 允许发送的配额上限（quota < 上限才发）
+# 1=紧急突发：quota<9 几乎总发；2=普通快讯/卡片：quota<5；3=低优汇总：quota<3
+QUOTA_PRIORITY_LIMIT = {1: 9, 2: 5, 3: 3}
 
 for d in (INBOX, OUTBOX, SENT, DONE, MEDIA, PROCESSING):
     os.makedirs(d, exist_ok=True)
@@ -55,6 +69,37 @@ def save_creds(creds):
         json.dump(creds, f, indent=2)
     os.chmod(tmp, 0o600)
     os.replace(tmp, CREDS)
+
+
+def _load_quota():
+    """读配额账本：{"sent_since_inbound": int}。文件不存在返回 0。"""
+    try:
+        with open(QUOTA_FILE) as f:
+            return int(json.load(f).get("sent_since_inbound", 0))
+    except (OSError, ValueError, KeyError):
+        return 0
+
+
+def _save_quota(n):
+    tmp = QUOTA_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"sent_since_inbound": int(n)}, f)
+    os.replace(tmp, QUOTA_FILE)
+
+
+def _quota_reset():
+    """用户入站：配额清零。"""
+    _save_quota(0)
+
+
+def _quota_bump():
+    """一次 sendmessage 成功：配额消耗 +1。"""
+    _save_quota(_load_quota() + 1)
+
+
+def _is_proactive(fn):
+    """proactive 发送（快讯/早报/卡片/ack）vs 用户回复（数字 msg_id 文件名）。"""
+    return fn.startswith(("ack_", "flash-", "briefing-", "market-", "digest-"))
 
 
 def render_qr_png(content, path=QRPNG):
@@ -289,20 +334,63 @@ def check_send_response(resp, fn=""):
             f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), fn))
 
 
+def _send_text_omit_token(api, to, txt):
+    """hermes-agent 的野路子（2026-10-08）：完全省略 context_token 字段重发。
+
+    对 "token 过期" 类 ret=-2 可能救回；配额耗尽类大概率无效。
+    只在 -2 时试一次，成功则返回响应，失败返回 None。"""
+    try:
+        r = api._post("ilink/bot/sendmessage", {
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to,
+                "client_id": uuid.uuid4().hex[:16],
+                "message_type": 2,  # BOT
+                "message_state": 2,  # FINISH
+                "item_list": [{"type": 1, "text_item": {"text": txt}}],
+                # context_token 字段完全省略，不传空字符串
+            }
+        }, retries=0)
+        check_send_response(r, "omit-token")
+        return r
+    except Exception as e:
+        print("SEND_EXC_OMIT", e, flush=True)
+        return None
+
+
 def send_text_retry(api, to, ctx, txt, fn=""):
-    """Send one text chunk with one retry (from CowAgent's _send retry)."""
-    r = None
-    for _ in range(2):
-        try:
-            r = api.send_text(to, txt, ctx)
-        except Exception as e:
-            print("SEND_EXC", fn, e, flush=True)
-            r = None
-        if r is not None:
-            check_send_response(r, fn)
-            if r.get("ret", 0) == 0:
-                return r
-        time.sleep(3)
+    """Send one text chunk.
+
+    2026-10-08 简化（Peter：重试叠三层无意义）：只做一次 api.send_text，
+    底层 _post 已有连接重试；-2 则试一次 omit-token fallback，不再 3s 睡眠重试。
+    2026-10-08 新增：分段计时（SLOW_SEND 诊断慢发送）。
+    """
+    t0 = time.time()
+    try:
+        r = api.send_text(to, txt, ctx)
+    except Exception as e:
+        print("SEND_EXC", fn, e, "dt=%.1fs" % (time.time() - t0), flush=True)
+        return None
+    dt = time.time() - t0
+    if dt > 10:
+        print("SLOW_SEND_TEXT", fn, "dt=%.1fs ret=%s"
+              % (dt, r.get("ret") if r else None), flush=True)
+    if r is not None:
+        check_send_response(r, fn)
+        if r.get("ret", 0) == 0:
+            return r
+    # -2：试一次去 token 重发（hermes-agent 招数）
+    if r is not None and r.get("ret") == -2:
+        print("TRY_OMIT_TOKEN", fn, flush=True)
+        t0 = time.time()
+        r2 = _send_text_omit_token(api, to, txt)
+        dt = time.time() - t0
+        if dt > 10:
+            print("SLOW_OMIT_TOKEN", fn, "dt=%.1fs" % dt, flush=True)
+        if r2 is not None and r2.get("ret", 0) == 0:
+            print("OMIT_TOKEN_OK", fn, flush=True)
+            return r2
+        print("OMIT_TOKEN_FAIL", fn, flush=True)
     return r
 
 
@@ -442,6 +530,7 @@ def cmd_receive(drain=False):
             with open(os.path.join(INBOX, mid + ".json"), "w") as f:
                 json.dump(rec, f, ensure_ascii=False)
             append_history(rec["from"], "user", text)  # 会话历史：用户侧
+            _quota_reset()  # 用户入站：ilink 回复配额清零
             desc = text[:30].replace("\n", " ") if text else "[图片]"
             print("INBOX", mid, desc, flush=True)
 
@@ -461,7 +550,17 @@ def _is_stale_ack(fn):
             or os.path.exists(os.path.join(DONE, base)))
 
 
-def cmd_send():
+def cmd_send(only=None):
+    """发送 outbox 任务。
+
+    only=None（默认）：发送全部 outbox 文件（显式 `wxbot.py send`、
+    ack_timer、proactive worker 的全量发送）。
+    only="<fn>"：只发这一个文件（`wxbot.py finish <id>` 的收尾路径）。
+
+    2026-10-16 隔离修复：finish 曾调全量 send，导致每次普通回复都
+    顺带发走 outbox 里的快讯/早报/卡片（10-15 实锤 3 次）。finish 必须
+    只发本单文件；proactive 只由显式 send 发。
+    """
     creds = load_creds()
     api = WeixinApi(base_url=creds.get("base_url", DEFAULT_BASE_URL),
                     token=creds.get("token", ""))
@@ -473,7 +572,7 @@ def cmd_send():
     lock_fh = open(SEND_LOCK, "w")
     try:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
-        _cmd_send_locked(api, msg_cache)
+        _cmd_send_locked(api, msg_cache, only=only)
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -519,10 +618,20 @@ SEND_RETRY_ATTEMPTS = 3           # 任务级重试次数（含首次）
 SEND_RETRY_BACKOFF = (5, 15, 30)  # 每次瞬时失败后的等待秒数，指数退避
 
 
-def _cmd_send_locked(api, msg_cache):
+def _cmd_send_locked(api, msg_cache, only=None):
+    """加锁发送。only=None 发全部；only="<fn>" 只发这一个文件。
+
+    finish 路径传 only=<id>.json：只发本单回复，绝不碰 outbox 里
+    其他文件（快讯/早报/卡片等 proactive 只由显式 send 发）。
+    滞留的同单 ack（ack_<id>.json）不用 finish 管：下次全量 send 时
+    _is_stale_ack 会判它过期（sent/<id>.json 已存在）直接归档不发，
+    绝不会迟发一条"正在想"。
+    """
     # 账本文件 *.parts.json 也以 .json 结尾，必须排除，否则会被当成待发任务
     files = sorted(f for f in os.listdir(OUTBOX)
                    if f.endswith(".json") and not f.endswith(".parts.json"))
+    if only is not None:
+        files = [f for f in files if f == only]
     for fn in files:
         path = os.path.join(OUTBOX, fn)
         if _is_stale_ack(fn):
@@ -532,12 +641,30 @@ def _cmd_send_locked(api, msg_cache):
                 pass
             print("SENT_SKIP_STALE_ACK", fn, flush=True)
             continue
-        # 任务级重试：瞬时故障（ret=-2 服务端拒绝、请求异常）退避重试；
-        # 永久性失败（参数错、文件缺失、登录过期）不重试，文件留给人工/下一轮。
-        # （2026-10-08 Peter 要求：失败时自动重新拉起发送，不再只靠 3 分钟兜底轮询）
+        # ilink 配额门控（2026-10-08）：用户回复永远发送，不受限。
+        # ack 延迟提示在配额>=5 时跳过（省配额给正文）。
+        # proactive（快讯/卡片）：Peter 要求"有快讯就推"，不做本地预判，
+        # 直接发，撞 -2 再 fail fast 排队（服务端是最终裁决）。
+        if _is_proactive(fn):
+            q = _load_quota()
+            if fn.startswith("ack_") and q >= QUOTA_ACK_LIMIT:
+                print("QUOTA_SKIP_ACK", fn, "quota=%d" % q, flush=True)
+                try:
+                    os.replace(path, os.path.join(SENT, fn))
+                except OSError:
+                    pass
+                continue
+        # 任务级重试：只对网络异常（请求断连/超时）退避重试；
+        # ret=-2 是配额耗尽的确定性拒绝，重试永不成功，直接 fail fast 留 outbox
+        # 等下次入站（2026-10-08 全网调研结论，hermes-agent #115359 同理）。
+        # （2026-10-08 Peter 要求：失败时自动重新拉起发送，不再只靠 3 分钟兜底轮询
+        #  ——该要求针对网络抖动；配额类 -2 不适用，已收回）
         for attempt in range(SEND_RETRY_ATTEMPTS):
             ok, transient = _send_one_file(api, msg_cache, fn, path)
-            if ok or not transient:
+            if ok:
+                _quota_bump()
+                break
+            if not transient:
                 break
             if attempt + 1 < SEND_RETRY_ATTEMPTS:
                 wait = SEND_RETRY_BACKOFF[
@@ -551,12 +678,13 @@ def _cmd_send_locked(api, msg_cache):
 def _is_transient_send_fail(resp):
     """判断发送失败是否值得重试。
 
-    ret=-2 prepare failed 是服务端瞬时拒绝（2026-10-07/08 实测持续约
-    15.5 小时后自行恢复），resp 为 None 是请求异常（断连/超时），都可重试。
+    2026-10-08 修正：ret=-2 prepare failed 是 ilink 回复配额耗尽的确定性拒绝
+    （约 10 条/用户入站，腾讯维护者确认），重试永不成功，直接 fail fast，
+    文件留 outbox 等下次入站。只有 resp 为 None（请求断连/超时）才值得重试。
     -14 登录过期、-3 参数错误、文件缺失等是永久性失败，重试无意义。"""
     if resp is None:
         return True
-    return resp.get("ret") == -2
+    return False
 
 
 def _send_one_file(api, msg_cache, fn, path):
@@ -643,10 +771,193 @@ def _send_one_file(api, msg_cache, fn, path):
         os.replace(path, os.path.join(SENT, fn))
         _clear_parts_ledger(fn)
         print("SENT", fn, flush=True)
+        # 2026-10-11 19:10：任何路径发出的 flash/digest，成功后自动把
+        # 各条标题记入共享去重池（防 responder finish 等旁路漏记导致重复推送）
+        if fn.startswith("flash-"):
+            try:
+                _record_digest_items_to_shared_pool(
+                    _extract_pool_titles(fn, text))
+            except Exception as e:
+                print("POOL_RECORD_FAIL", fn, e, flush=True)
         return True, False
     except Exception as e:
         print("SEND_ERROR", fn, e, flush=True)
         return False, True
+
+
+MERGE_BACKLOG_THRESHOLD = 4  # outbox 里 flash 积压达到这个数就合并成一条汇总
+
+
+def _record_digest_items_to_shared_pool(items):
+    """merge-backlog 去重补记（2026-10-11 15:38 重复推送事故的根因修复）。
+
+    digest 合并后原文件被删除，若各条标题不记入共享去重池
+    （pushed-shared.json），后续快讯轮的去重检查会漏掉它们，
+    同一新闻会被重复推送（15:38"特朗普称乌克兰该换总统"与
+    14:01 digest 第 2 条重复就是这么发生的）。
+
+    在合并时（而非发送时）登记：原文件已删除、内容已收进 digest，
+    digest 要么在 outbox 待发、要么已发出，24 小时内再出现同题
+    直接判重是正确的。写入失败不影响合并本身，只打日志。
+    """
+    try:
+        try:
+            with open(SHARED_POOL) as f:
+                pool = json.load(f)
+        except (OSError, ValueError):
+            pool = {}
+        pushed = pool.get("pushed")
+        if not isinstance(pushed, list):
+            pushed = []
+            pool["pushed"] = pushed
+        cst = datetime.timezone(datetime.timedelta(hours=8))
+        now = datetime.datetime.now(cst)
+        existing = {e.get("title") for e in pushed if isinstance(e, dict)}
+        n_new = 0
+        for t in items:
+            if t and t not in existing:
+                pushed.append({"title": t, "ts": now.isoformat(),
+                               "by": "flash-digest"})
+                existing.add(t)
+                n_new += 1
+        # 顺手清理 48 小时前的旧记录（与快讯 cron 的清理口径一致）
+        cutoff = now - datetime.timedelta(hours=48)
+        kept = []
+        for e in pushed:
+            try:
+                ts = datetime.datetime.fromisoformat(e.get("ts", ""))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=cst)
+            except (ValueError, AttributeError):
+                continue
+            if ts >= cutoff:
+                kept.append(e)
+        pool["pushed"] = kept
+        tmp = SHARED_POOL + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(pool, f, ensure_ascii=False)
+        os.replace(tmp, SHARED_POOL)
+        print("SHARED_POOL_RECORDED", n_new, flush=True)
+    except Exception as e:
+        print("SHARED_POOL_FAIL", e, flush=True)
+
+
+def _extract_pool_titles(fn, text):
+    """从已发送的 flash 文件提取应记入共享去重池的标题列表。
+
+    2026-10-11 19:10 修复：14:01 经 responder finish 发出的 5 条 digest，
+    其各条标题从未记入共享池（只记了整条 digest 文本），导致 18:41 的
+    利雅得快讯去重漏检、18:56 的 digest 差点重复推送已送达内容。
+    此后任何路径发出的 flash/digest，成功后都自动补记。
+    """
+    titles = []
+    if "digest" in fn:
+        # digest 文本格式："📰 快讯汇总（N条…）\n· 标题1\n· 标题2…"
+        for line in (text or "").split("\n"):
+            line = line.strip()
+            if line.startswith("·"):
+                t = line[1:].strip()
+                if t:
+                    titles.append(t)
+    else:
+        title = (text or "").split("\n")[0].strip()
+        title = re.sub(r"^[⚡\s]*快讯：?", "", title).strip()
+        if title:
+            titles.append(title)
+    return titles
+
+
+def _is_text_delivered(text, msg_cache):
+    """检查文本是否已在 msg_cache 中（已送达微信）。
+
+    2026-10-11 18:59 修复：merge-backlog 曾把已送达的 Isaias 文本
+    （msg_cache 有真实 message_id 7514987327573018376，18:21–18:27 送达）
+    重新收进 digest，造成重复推送。合并前必须排除已送达的条目，
+    否则违背"不重复推送"承诺。
+    msg_cache 格式 {message_id: text}，按 value 精确匹配。
+    """
+    if not text:
+        return False
+    for cached_text in msg_cache.values():
+        if cached_text == text:
+            return True
+    return False
+
+
+def cmd_merge_backlog():
+    """合并积压的 flash：outbox 里未发送的 flash-* 文件达到阈值时，
+    合并成一条"快讯汇总"后删除原文件，避免通道恢复后一条条轰炸。
+
+    2026-10-08 Peter 要求（优化项 2）。幂等：汇总文件本身
+    （*-digest.json）不参与再次合并；不足阈值时直接跳过。
+    加锁执行，与 send 互斥，避免和正在发送的文件打架。
+    2026-10-11 18:59：合并前查 msg_cache，已送达的文本不再收进
+    汇总（防重复推送）；该文件直接删除（文本已出，图片为辅）。
+    """
+    lock_fh = open(SEND_LOCK, "w")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        files = sorted(f for f in os.listdir(OUTBOX)
+                       if f.startswith("flash-") and f.endswith(".json")
+                       and not f.endswith(".parts.json")
+                       and not f.endswith("-digest.json"))
+        if len(files) < MERGE_BACKLOG_THRESHOLD:
+            print("MERGE_SKIP", len(files), flush=True)
+            return
+        msg_cache = load_msg_cache()
+        items, to = [], None
+        for fn in files:
+            try:
+                with open(os.path.join(OUTBOX, fn)) as f:
+                    job = json.load(f)
+            except (OSError, ValueError):
+                continue
+            text = job.get("text", "") or ""
+            if _is_text_delivered(text, msg_cache):
+                # 文本已送达微信，不再收进汇总，直接删除原文件
+                # （图片分片无需单独补发，新闻本身已出）
+                try:
+                    os.remove(os.path.join(OUTBOX, fn))
+                except OSError:
+                    pass
+                _clear_parts_ledger(fn)
+                print("MERGE_SKIP_DELIVERED", fn, flush=True)
+                continue
+            if to is None:
+                to = job.get("to")
+            title = text.split("\n")[0].strip()
+            title = re.sub(r"^[⚡\s]*快讯：?", "", title).strip()
+            if title:
+                items.append(title)
+        if not to or not items:
+            print("MERGE_FAIL", "no usable content", flush=True)
+            return
+        # 文件名时间戳用 Asia/Shanghai（VM 本地是 UTC，直接 strftime 会差 8 小时）
+        ts = (datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+              .strftime("%Y%m%d%H%M"))
+        digest_fn = "flash-%s-digest.json" % ts
+        digest_text = ("📰 快讯汇总（%d条，通道恢复补发）\n" % len(items)
+                       + "\n".join("· " + t for t in items))
+        tmp = os.path.join(OUTBOX, digest_fn + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump({"to": to, "text": digest_text}, f, ensure_ascii=False)
+        os.replace(tmp, os.path.join(OUTBOX, digest_fn))
+        for fn in files:
+            try:
+                os.remove(os.path.join(OUTBOX, fn))
+            except OSError:
+                pass
+            _clear_parts_ledger(fn)
+        # 2026-10-11 15:38 重复推送事故：合并后各条标题必须记入共享去重池，
+        # 否则后续快讯轮的去重检查漏掉它们，同一新闻会被重复推送。
+        _record_digest_items_to_shared_pool(items)
+        print("MERGED", len(files), "->", digest_fn, flush=True)
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_fh.close()
 
 
 def cmd_finish(msg_id, expected_claim_ts=None):
@@ -654,7 +965,9 @@ def cmd_finish(msg_id, expected_claim_ts=None):
 
     前置：processing/<id>.json 已存在（hook 脚本认领时 mv 过来，并打了 claim_ts），
     outbox/<id>.json 已由 worker 写好（含 to/context_token/text，可选 image/video/file）。
-    发送复用 cmd_send 的加锁整单逻辑（含分片账本/重试/历史记录/引用缓存）。
+    发送复用 cmd_send 的加锁逻辑，但只发本单文件（only=<id>.json），
+    绝不碰 outbox 里其他文件（快讯/早报/卡片等 proactive 只由显式 send 发；
+    2026-10-16 隔离修复：此前 finish 调全量 send，普通回复会顺带发走 proactive）。
     失败时 processing 留在原地，由 5 分钟兜底 cron 接手，绝不静默丢单。
 
     expected_claim_ts（可选）：worker 从唤醒 payload 里拿到的 claim_ts。
@@ -714,7 +1027,7 @@ def cmd_finish(msg_id, expected_claim_ts=None):
         return 1
     out_mtime = os.path.getmtime(out_path)
 
-    cmd_send()  # 加锁发送 outbox（整单逻辑：分段/图片/账本/历史都在里面）
+    cmd_send(only=msg_id + ".json")  # 只发本单，绝不碰 outbox 里其他文件
 
     if not os.path.exists(os.path.join(SENT, msg_id + ".json")):
         print("FINISH_FAIL", msg_id, "send incomplete, left for fallback",
@@ -762,11 +1075,13 @@ if __name__ == "__main__":
         cmd_receive(drain="--drain" in sys.argv)
     elif cmd == "send":
         cmd_send()
+    elif cmd == "merge-backlog":
+        cmd_merge_backlog()
     elif cmd == "finish":
         if len(sys.argv) < 3:
             print("usage: wxbot.py finish <msg_id> [expected_claim_ts]", flush=True)
             sys.exit(1)
         sys.exit(cmd_finish(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None))
     else:
-        print("usage: wxbot.py {qr|wait_login|receive [--drain]|send|finish <msg_id> [expected_claim_ts]}")
+        print("usage: wxbot.py {qr|wait_login|receive [--drain]|send|merge-backlog|finish <msg_id> [expected_claim_ts]}")
         sys.exit(1)

@@ -52,14 +52,19 @@ cd ~/workspace/muse-auto-approve && node work/muse-rpc.cjs list 2>/dev/null | gr
 ## 运维
 
 - **部署目录**：`~/workspace/muse-auto-approve`（代码、会话、日志全在这里）
-- **保活**：`keepalive.sh` + 平台 cron（`muse-auto-approve-keepalive`，每 5 分钟）。
-  daemon 掉了会自动用已存会话（`data/cookies.json`）重启，不需要密码。
+- **保活**：`keepalive.sh` + hook 门控（`muse-auto-approve-gate`，每 300 秒）。
+  门控脚本在 bash 内跑 `keepalive.sh`：daemon 正常 / 刚被拉起则静默，不唤醒
+  agent；只有会话过期（`NEED_PASSWORD`，24 小时内未提醒过）或连续 3 次启动
+  失败（`START_FAILED`）时才唤醒 agent。旧的 5 分钟 agent cron
+  （`muse-auto-approve-keepalive`）已于 2026-10-16 删除（cron 每轮必起 agent，
+  空轮也烧额度）。
 - **密码规则**：muse.ai 密码只在 daemon 进程的环境变量里，**从不写盘、不记记忆**。
   只有当登录会话彻底过期（VM 停机太久）时，才需要找用户重新要一次密码做登录。
-  保活 cron 在这种情况下 24 小时内只提醒用户一次。
+  门控 hook 在这种情况下 24 小时内只提醒用户一次（throttle 文件由被唤醒的
+  agent 在发完提醒后 touch，门控脚本只读不写）。
 - **手动重启**（会话有效时）：`cd ~/workspace/muse-auto-approve && node muse-daemon.cjs`
-- **彻底停掉**：`kill $(cat data/muse-daemon.pid)`，并把 cron `muse-auto-approve-keepalive` 禁用/删除，
-  否则 5 分钟后会被保活拉起来。
+- **彻底停掉**：`kill $(cat data/muse-daemon.pid)`，并把 hook `muse-auto-approve-gate`
+  禁用/删除，否则 300 秒后会被门控拉起来。
 
 ## 注意事项
 
@@ -108,16 +113,17 @@ tail -n 5 log/daemon-log.ndjson
 # 应出现 pending_found → decided(decision=allow_always)，网页版全程无卡弹出
 ```
 
-7. 建保活 cron（用平台 cron 工具）：每 5 分钟执行
-   `bash ~/workspace/muse-auto-approve/keepalive.sh`，正常静默。
-   daemon 掉线时用已存会话自动重启；会话彻底过期时脚本写
-   `data/.needs-password` 不再空转，此时 24 小时内提醒用户一次要密码。
+7. 建保活门控 hook：id `muse-auto-approve-gate`，poll 300s，script 见本 skill
+   末尾附录二，装到 `~/hooks/scripts/` 并用 hooks.add 注册；dry_run 测静默路径
+   再 enable。门控在 bash 内跑 `keepalive.sh`：daemon 掉线时用已存会话自动
+   重启；会话彻底过期时脚本写 `data/.needs-password` 不再空转，此时 24 小时内
+   提醒用户一次要密码；连续 3 次启动失败才唤醒 agent 查日志。
 
 密码规则：只在第 4 步用一次（环境变量），**从不写盘、不记记忆**。
 同一账号迁移时也可把旧机器的 `data/cookies.json` 安全拷过来（别走聊天明文），
 直接跳过第 4 步，但先停掉旧的 daemon，别两边同时跑。
 
-## 附录：keepalive.sh
+## 附录一：keepalive.sh
 
 ```bash
 #!/bin/bash
@@ -162,4 +168,94 @@ if grep -q "NO_CREDENTIALS\|没有可用的登录凭据" "$STDOUTLOG" 2>/dev/nul
 fi
 echo "START_FAILED"
 exit 1
+```
+
+## 附录二：muse-auto-approve-gate.sh
+
+门控 hook 脚本（2026-10-16 起替代 5 分钟 agent cron）：bash 每 300 秒跑
+`keepalive.sh`，正常静默；`NEED_PASSWORD` 24 小时内未提醒过才唤醒；
+`START_FAILED` 连续 3 次才唤醒。`dry-run` 时不跑 `keepalive.sh`（它会真的
+拉起 daemon，属于修改性动作），只用 pgrep 探活汇报决策，不写任何状态文件。
+
+```bash
+#!/usr/bin/env bash
+# muse-auto-approve-gate: daemon 保活的门控（2026-10-16 起，替代每 5 分钟的 agent cron）。
+# - bash 每 5 分钟跑 keepalive.sh：daemon 正常 / 刚被拉起 → 静默，不唤醒 agent。
+# - NEED_PASSWORD（会话过期）：只有当 24 小时内没提醒过时才唤醒 agent 发提醒。
+#   throttle 文件由被唤醒的 agent 在发完提醒后 touch，本脚本只读不写。
+# - START_FAILED：bash 内计数，连续 3 次才唤醒 agent 查日志；成功时清零。
+# - dry-run（HATCH_HOOK_DRY_RUN=1）时不跑 keepalive.sh（它会真的拉起 daemon，
+#   属于修改性动作），只用 pgrep 探活汇报决策；不写任何状态文件。
+set -euo pipefail
+source "$HATCH_HOOK_RUNTIME"
+
+KEEPALIVE_SH="${MUSE_AUTO_APPROVE_KEEPALIVE_SH:-$HOME/workspace/muse-auto-approve/keepalive.sh}"
+APPROVE_DIR="${MUSE_AUTO_APPROVE_DIR:-$HOME/workspace/muse-auto-approve}"
+NOTIFIED_FILE="$APPROVE_DIR/data/.needs-password-notified"
+STATE_DIR="${HOOKS_STATE_DIR:-$HOME/hooks/state}"
+FAIL_COUNT_FILE="$STATE_DIR/muse-auto-approve-fail-count"
+DRY="${HATCH_HOOK_DRY_RUN:-0}"
+mkdir -p "$STATE_DIR"
+
+now="$(date +%s)"
+
+# --- dry-run：只探活，不跑 keepalive.sh，不写状态 ---
+if [ "$DRY" = "1" ]; then
+  if pgrep -f "^node muse-daemon\.cjs" >/dev/null 2>&1; then
+    silent "dry-run: daemon alive, keepalive.sh not run" '{}'
+  else
+    wake "dry-run: daemon down, keepalive.sh would run (restart suppressed)" '{"dry_run":true}'
+  fi
+  exit 0
+fi
+
+# --- live：跑 keepalive.sh，按退出码处理 ---
+set +e
+_out="$("$KEEPALIVE_SH" 2>&1)"
+_rc=$?
+set -e
+
+# 成功时清零连续失败计数（STARTED = 刚被拉起，也算成功）
+reset_fail_count() {
+  rm -f "$FAIL_COUNT_FILE"
+}
+
+case "$_rc" in
+  0)
+    reset_fail_count
+    if [ "${_out#STARTED}" != "$_out" ]; then
+      log "daemon restarted by keepalive: $_out" '{}'
+    fi
+    silent "daemon ok" '{}'
+    ;;
+  2)
+    # NEED_PASSWORD：会话过期。24 小时内提醒过则静默。
+    reset_fail_count
+    if [ -f "$NOTIFIED_FILE" ]; then
+      _notified_mtime="$(stat -c %Y "$NOTIFIED_FILE" 2>/dev/null || echo 0)"
+      if [ "$((now - _notified_mtime))" -lt 86400 ]; then
+        silent "session expired, reminded within 24h" '{"need_password":true}'
+        exit 0
+      fi
+      unset _notified_mtime
+    fi
+    wake "muse-auto-approve 登录会话过期（NEED_PASSWORD），需要用户重新提供密码" '{"need_password":true}'
+    ;;
+  *)
+    # START_FAILED 或其它非预期退出码：连续 3 次才唤醒，偶发失败静默重试。
+    _count="$(cat "$FAIL_COUNT_FILE" 2>/dev/null || echo 0)"
+    case "$_count" in
+      ''|*[!0-9]*) _count=0 ;;
+    esac
+    _count="$((_count + 1))"
+    echo "$_count" > "$FAIL_COUNT_FILE"
+    if [ "$_count" -ge 3 ]; then
+      wake "muse-auto-approve daemon 连续 ${_count} 次启动失败（START_FAILED），需查日志" "{\"start_failed\":true,\"consecutive_failures\":${_count}}"
+    else
+      log "keepalive START_FAILED, consecutive=${_count}, waiting" '{}'
+      silent "keepalive START_FAILED (consecutive=${_count}), waiting" '{"start_failed":true}'
+    fi
+    unset _count
+    ;;
+esac
 ```

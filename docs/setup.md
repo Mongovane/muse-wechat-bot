@@ -80,7 +80,7 @@ chmod +x ~/hooks/scripts/wechat-inbox.sh
 1. **看门狗**：接收器不在就重启；`receiver.log` 尾部有 `SESSION_EXPIRED` 则唤醒通知用户重扫（用 `~/hooks/state/` 下的 flag 防重复打扰）
 2. **收件箱监听**：`inbox/*.json` 非空则 wake，payload 带上 msg_ids
 
-然后注册 hook（`poll_interval_secs: 10`，delivery 保持默认当前对话）：
+然后注册 hook（`poll_interval_secs: 5`，delivery 保持默认当前对话）：
 
 - id：`wechat-inbox`
 - script：`~/hooks/scripts/wechat-inbox.sh`
@@ -88,14 +88,19 @@ chmod +x ~/hooks/scripts/wechat-inbox.sh
 
 注册后先 `dry_run` 两次：一次空收件箱（应 silent），一次丢个测试文件进 inbox（应 wake 且 payload 带文件名），都对再 `enable`，最后删掉测试文件。
 
-## 6. 创建兜底 cron（5 分钟）
+## 6. 创建兜底门控 hook（180 秒）
 
-正常消息都由 hook 处理，cron 只捡漏（hook worker 崩溃导致的消息卡住）。新建定时任务：
+正常消息都由 hook 处理，兜底只捡漏（hook worker 崩溃导致的消息卡住）。
+兜底不是 agent cron（cron 每轮必起 agent，空轮也烧额度），而是 hook 门控：
 
-- id：`wechat-bot-responder`，interval `5m`
-- body：全文复制 `<本仓库>/bot/prompts/sweeper-cron.md`
+- id：`wechat-sweeper-gate`，interval `180s`
+- script：`<本仓库>/hooks/scripts/wechat-sweeper-gate.sh`
+- prompt：全文复制 `<本仓库>/bot/prompts/sweeper-gate-worker.md`
 
-它会：备用看门狗 → 处理超过 3 分钟没人认领的 inbox 文件 → 把超过 10 分钟的 `processing/` 文件打回 inbox。认领同样用 `mv` 原子操作，和 hook 不会 double。
+它会：门控脚本在 bash 内做看门狗（接收器死/卡死直接重启，不唤醒 agent）→
+只在超过 2 分钟没人认领的 inbox 文件、processing 超时（无 `.alive` 4 分钟 /
+有 `.alive` 10 分钟）、登录态过期时唤醒 worker。认领同样用 `mv` 原子操作，
+和 hook 不会 double。
 
 ## 7. 装 skills
 
@@ -123,7 +128,7 @@ skill 映射关系写在两份 prompt 里，加新 skill 时同步加一行。�
 
 让用户从微信发一条"你好"：
 
-1. 10 秒内 hook 应 wake（`hooks.logs` 可查）
+1. 5 秒内 hook 应 wake（`hooks.logs` 可查）
 2. worker 认领 → Muse 作答 → outbox → send → 微信收到回复
 3. `inbox/` 文件被移到 `done/`
 
