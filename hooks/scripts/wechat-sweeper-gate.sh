@@ -2,8 +2,8 @@
 # wechat-sweeper-gate: 兜底清扫的门控（2026-10-16 起，替代每 3 分钟的 agent cron）。
 # - 看门狗（bash 内完成，不唤醒 agent）：接收器死了 → 重启；卡死（buf.txt > 3 分钟
 #   未更新且进程已运行 > 3 分钟）→ kill 重启。逻辑与 wechat-inbox.sh 相同。
-# - 唤醒条件（只在真有漏网时唤醒 agent）：inbox 有 > 2 分钟未处理的文件；
-#   processing 认领超时（有 .alive 给 10 分钟，无 .alive 给 4 分钟）；
+# - 唤醒条件（只在真有漏网时唤醒 agent）：inbox 有 > 1 分钟未处理的文件；
+#   processing 认领超时（有 .alive 给 10 分钟，无 .alive 给 2 分钟）；
 #   登录态过期（接收侧 SESSION_EXPIRED 且接收器已死；发送侧 -14 标记）。
 # - proactive 的 outbox 文件单独存在不是唤醒条件（flash/早报/卡片 worker 自己发，
 #   兜底不碰）；只有 processing 超时的单才唤醒（有 outbox → finish，无 outbox → 重处理）。
@@ -112,12 +112,12 @@ if [ -f "$BOT_DIR/.send_session_expired" ]; then
   unset _marker_mtime _notified_mtime
 fi
 
-# --- 3. 漏网：inbox 里超过 2 分钟未处理的文件 ---
+# --- 3. 漏网：inbox 里超过 1 分钟未处理的文件 ---
 stale_inbox=()
 shopt -s nullglob
 for _f in "$BOT_DIR"/inbox/*.json; do
   _mt="$(stat -c %Y "$_f" 2>/dev/null || echo "$now")"
-  if [ "$((now - _mt))" -gt 120 ]; then
+  if [ "$((now - _mt))" -gt 60 ]; then
     stale_inbox+=("$(basename "$_f" .json)")
   fi
 done
@@ -126,7 +126,7 @@ if [ "${#stale_inbox[@]}" -gt 0 ]; then
 fi
 
 # --- 4. 漏网：processing 里超时的认领 ---
-# 有 .alive = worker 已启动，给 10 分钟；无 .alive = worker 没起来，给 4 分钟。
+# 有 .alive = worker 已启动，给 10 分钟；无 .alive = worker 没起来，给 2 分钟。
 # 超时起点用 claim_ts（hook 认领时写入），缺失则退回文件 mtime。
 timed_out=()
 for _p in "$BOT_DIR"/processing/*.json; do
@@ -137,7 +137,7 @@ for _p in "$BOT_DIR"/processing/*.json; do
     _cts="$(stat -c %Y "$_p" 2>/dev/null || echo "$now")"
   fi
   _age="$((now - _cts))"
-  if [ -f "$BOT_DIR/processing/${_id}.alive" ]; then _limit=600; else _limit=240; fi
+  if [ -f "$BOT_DIR/processing/${_id}.alive" ]; then _limit=600; else _limit=120; fi
   if [ "$_age" -gt "$_limit" ]; then
     timed_out+=("$_id")
   fi

@@ -23,7 +23,7 @@
                                 → processing/ → done/
 ```
 
-看门狗下沉在 hook 的 bash 脚本里：接收器挂了直接拉起；只有微信服务端作废登录态（`SESSION_EXPIRED`）时才需要重新扫码。另有兜底门控 hook（每 180 秒），只捡漏。
+看门狗下沉在 hook 的 bash 脚本里：接收器挂了直接拉起；只有微信服务端作废登录态（`SESSION_EXPIRED`）时才需要重新扫码。另有兜底门控 hook（每 60 秒），只捡漏。
 
 ## 快速开始
 
@@ -53,7 +53,7 @@
 ├── hooks/
 │   └── scripts/
 │       ├── wechat-inbox.sh # 事件驱动脚本：看门狗 + 收件箱监听（5 秒）
-│       └── wechat-sweeper-gate.sh # 兜底门控：bash 看门狗 + 漏网唤醒（180 秒）
+│       └── wechat-sweeper-gate.sh # 兜底门控：bash 看门狗 + 漏网唤醒（60 秒）
 ├── crons/
 │   └── README.md           # 说明：兜底已改为 hook 门控，不再有 agent cron
 ├── docs/

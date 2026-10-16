@@ -41,8 +41,8 @@ worker 用 `mv` 原子认领到 `processing/` → Muse 中文作答（按需调 
 
 - **hook**（`hooks/scripts/wechat-inbox.sh`，每 5 秒）：纯 bash，零 agent 成本。发现新文件立刻 `wake`，只在有事时才起 worker。
 - **看门狗下沉**：原来每分钟起一个 agent 只为了 `pgrep` 看进程，现在 hook 脚本顺手做：挂了 `setsid nohup` 拉起；`SESSION_EXPIRED` 才唤醒通知用户重扫（state flag 防重复）。
-- **兜底门控 hook**（每 180 秒）：只处理漏网——门控脚本在 bash 内做看门狗；
-  只在超过 2 分钟没人认领的 inbox 文件、processing 超时（无 `.alive` 4 分钟 /
+- **兜底门控 hook**（每 60 秒）：只处理漏网——门控脚本在 bash 内做看门狗；
+  只在超过 1 分钟没人认领的 inbox 文件、processing 超时（无 `.alive` 2 分钟 /
   有 `.alive` 10 分钟）、登录态过期时唤醒 worker。兜底不是 agent cron
   （cron 每轮必起 agent，空轮也烧额度）。
 

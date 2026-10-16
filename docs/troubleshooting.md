@@ -31,8 +31,8 @@ hook 的看门狗一般 5 秒内已经自动拉起了，先 `pgrep` 确认再手
 
 1. `ls ~/workspace/wechat-bot/inbox/` 看是否有文件
 2. `hooks.logs --id wechat-inbox` 看 hook 有没有 wake
-3. 有 wake 但 worker 没处理 → 看兜底门控日志；超过 2 分钟的会被门控唤醒 worker 捡走
-4. `processing/` 里超时的文件（无 `.alive` 4 分钟 / 有 `.alive` 10 分钟）会被门控唤醒 worker 处理，属正常自愈
+3. 有 wake 但 worker 没处理 → 看兜底门控日志；超过 1 分钟的会被门控唤醒 worker 捡走
+4. `processing/` 里超时的文件（无 `.alive` 2 分钟 / 有 `.alive` 10 分钟）会被门控唤醒 worker 处理，属正常自愈
 
 ## 重复回复了
 

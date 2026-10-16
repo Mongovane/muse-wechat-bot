@@ -88,17 +88,17 @@ chmod +x ~/hooks/scripts/wechat-inbox.sh
 
 注册后先 `dry_run` 两次：一次空收件箱（应 silent），一次丢个测试文件进 inbox（应 wake 且 payload 带文件名），都对再 `enable`，最后删掉测试文件。
 
-## 6. 创建兜底门控 hook（180 秒）
+## 6. 创建兜底门控 hook（60 秒）
 
 正常消息都由 hook 处理，兜底只捡漏（hook worker 崩溃导致的消息卡住）。
 兜底不是 agent cron（cron 每轮必起 agent，空轮也烧额度），而是 hook 门控：
 
-- id：`wechat-sweeper-gate`，interval `180s`
+- id：`wechat-sweeper-gate`，interval `60s`
 - script：`<本仓库>/hooks/scripts/wechat-sweeper-gate.sh`
 - prompt：全文复制 `<本仓库>/bot/prompts/sweeper-gate-worker.md`
 
 它会：门控脚本在 bash 内做看门狗（接收器死/卡死直接重启，不唤醒 agent）→
-只在超过 2 分钟没人认领的 inbox 文件、processing 超时（无 `.alive` 4 分钟 /
+只在超过 1 分钟没人认领的 inbox 文件、processing 超时（无 `.alive` 2 分钟 /
 有 `.alive` 10 分钟）、登录态过期时唤醒 worker。认领同样用 `mv` 原子操作，
 和 hook 不会 double。
 
