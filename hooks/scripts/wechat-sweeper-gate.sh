@@ -74,7 +74,7 @@ else
         if [ -n "$_pids" ]; then kill $_pids 2>/dev/null || true; fi
         sleep 3
         _pids="$(pgrep -f "[w]xbot.py receive" || true)"
-        if [ -n "$_pids" ]; then kill -9 "$_pids" 2>/dev/null || true; sleep 1; fi
+        if [ -n "$_pids" ]; then kill -9 $_pids 2>/dev/null || true; sleep 1; fi
         if ! pgrep -f "[w]xbot.py receive" >/dev/null 2>&1; then
           cd "$BOT_DIR"
           cp -f receiver.log receiver.log.prev 2>/dev/null || true
@@ -133,7 +133,11 @@ for _p in "$BOT_DIR"/processing/*.json; do
   [ -e "$_p" ] || continue
   _id="$(basename "$_p" .json)"
   _cts="$(jq -r '.claim_ts // 0' "$_p" 2>/dev/null || echo 0)"
-  if [ -z "$_cts" ] || [ "$_cts" = "0" ] || [ "$_cts" = "null" ]; then
+  # claim_ts 清洗：去掉浮点小数、非数字一律当 0（退回文件 mtime）；
+  # 不清洗时 "123.5" / "abc" 会让 $((now - _cts)) 算术报错（set -e 直接退出）。
+  _cts="${_cts%%.*}"
+  case "$_cts" in ''|*[!0-9]*) _cts=0 ;; esac
+  if [ "$_cts" = "0" ]; then
     _cts="$(stat -c %Y "$_p" 2>/dev/null || echo "$now")"
   fi
   _age="$((now - _cts))"

@@ -81,13 +81,25 @@ hook worker 和兜底 worker 可能同时看到同一个文件。规则只有一
 3. 作答：worker agent 运行，简单问题约 20–40 秒，复杂问题（联网查、长思考） irreducible
 4. 发送：1–2 秒
 
-### "对方正在输入"的替代方案
+### "对方正在输入…"（sendtyping + keepalive，2026-10-16 实测可用）
 
-ilink 协议的 `send_typing` 实测调通（`typing_ticket` 从 `get_config(user_id)` 取，
-每次 `ret=0`），但微信客户端不渲染，属协议限制。所以用 `bot/ack_timer.sh`
-代替：worker 认领消息后立刻在后台启动它，10 秒后若还没回完（`processing/<id>.json`
-还在、且 `outbox/<id>.json` 还没写好），就发一条"收到，正在想，稍等…"；
-回得快则静默退出，绝不打扰。三个分支都经过实测。
+早期结论"微信客户端不渲染 sendtyping"是错的。2026-10-16 Peter 实测：
+`send_typing`（`typing_ticket` 从 `get_config(user_id)` 取，每次 `ret=0`）在 1 秒内
+让客户端显示"对方正在输入…"，但指示灯 TTL 只有几秒，单次发送不覆盖整个思考。
+
+所以现在是两段式：
+
+1. 收到消息立即 `getconfig → sendtyping`（`wxbot.py` 接收器内，`TYPING <mid> True` 记日志）；
+2. `bot/ack_timer.sh` 每 3 秒重发一次 typing（keepalive），直到 `processing/<id>.json`
+   消失（已回完）或 300 秒超时；正式回复发出后发送 command=2 取消。
+
+ack 文字（"收到你的消息啦，我需要大约半分钟思考一下~"）已于 2026-10-16 去掉：
+指示灯已覆盖反馈，文字是多余的消息噪音。指示灯文字本身改不了——它是微信客户端
+原生 UI，sendtyping API 无文本参数（请求体只有 ilink_user_id / to_user_id / ticket /
+command / status）。
+
+普通回复与 proactive 隔离：取消指示灯只在普通回复路径（快讯/早报/卡片的取消会误关
+正在思考的回复的指示灯）。
 
 ## 审批模型
 

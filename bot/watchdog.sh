@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # watchdog: fast-fail for hook workers that never start.
-# If a claimed message's worker hasn't touched its .alive marker within 30s,
+# If a claimed message's worker hasn't touched its .alive marker within 20s,
 # the worker never started (runtime spawn failure) -> requeue to inbox/ for
 # another wake. Caps retries at 2, then leaves it for the cron fallback.
 # A worker that DID start (alive marker exists) is left alone even if slow.
-# 30s (was 75s): healthy worker startup is ~2s; 30s of silence means dead.
+# 20s (was 30s, 2026-10-16): healthy worker startup is ~2s; 20s of silence
+# means dead (10x margin, false-positive risk low).
 # Stale-worker double-send is prevented by `wxbot.py finish <id> <claim_ts>`
 # ownership check (2026-10-04).
 set -uo pipefail
@@ -12,7 +13,7 @@ set -uo pipefail
 BOT_DIR="${1:?bot dir required}"
 id="${2:?msg id required}"
 
-sleep 30
+sleep 20
 
 proc="$BOT_DIR/processing/$id.json"
 alive="$BOT_DIR/processing/$id.alive"
@@ -30,7 +31,7 @@ if [ "$retries" -ge 2 ]; then
   exit 0
 fi
 
-# Mark: skip the ack on re-wake (user already got one at 30s), bump counter.
+# Mark: skip keepalive on re-wake (sweeper's worker already started one), bump counter.
 tmp="$proc.tmp"
 if jq --argjson r $((retries + 1)) \
     '.watchdog_retries = $r | .watchdog_noack = true' \

@@ -10,10 +10,10 @@ Subcommands:
   receive     Daemon: long-poll getUpdates -> inbox/<msg_id>.json
               (text, server-transcribed voice, images downloaded from CDN)
   send        Send outbox/*.json -> sent/ (all files; explicit full send).
-              Use cmd_send(only=<fn>) to send exactly one file.
+              Use `wxbot.py send <fn>` or cmd_send(only=<fn>) to send exactly one file.
   finish      Worker one-shot: send ONLY outbox/<id>.json, move
               processing/<id>.json -> done/, append latency entry.
-              FINISH_FAIL leaves processing/ for the 5-min fallback sweeper.
+              FINISH_FAIL leaves processing/ for the fallback sweeper.
               finish must never flush other outbox files (2026-10-16:
               full-send-in-finish leaked flash/briefing/cards into replies).
 """
@@ -35,6 +35,11 @@ SENT = os.path.join(BASE, "sent")
 DONE = os.path.join(BASE, "done")
 PROCESSING = os.path.join(BASE, "processing")
 SEND_LOCK = os.path.join(BASE, "send.lock")
+RECEIVE_LOCK = os.path.join(BASE, "receive.lock")
+# sendtyping 票据缓存：getconfig 拿到的 typing_ticket，有效期约 20 小时
+# （nanoclaw #1553 实测；agentserver 独立落地同一 API，确认客户端真渲染）。
+TYPING_TICKETS_FILE = os.path.join(BASE, "typing_tickets.json")
+TYPING_TICKET_TTL = 20 * 3600
 LATENCY_LOG = os.path.join(os.path.expanduser("~"),
                            "workspace/goals/muse/hidden_files/wechat-latency.jsonl")
 SHARED_POOL = os.path.join(os.path.expanduser("~"),
@@ -44,6 +49,7 @@ QRFILE = os.path.join(BASE, "qr.json")
 QRPNG = os.path.join(BASE, "qr.png")
 SESSION_EXPIRED = -14
 CHUNK = 3500
+SEEN_MAX = 1000  # 接收器内存去重集上限，超了按 LRU 丢最老的（磁盘兜底见 _is_msg_already_processed）
 # ilink 回复配额：每条用户入站后 bot 最多发约 10 条，第 11 条起 ret=-2
 # （2026-10-08 全网调研确认：Thysrael/Horizon PR#159、clawock、腾讯维护者亲口确认）。
 # 本地账本：proactive 发送按优先级排队，ack 在配额 >=5 时跳过。
@@ -58,17 +64,125 @@ for d in (INBOX, OUTBOX, SENT, DONE, MEDIA, PROCESSING):
     os.makedirs(d, exist_ok=True)
 
 
+def _atomic_write_json(path, obj, indent=None, mode=None):
+    """Write JSON atomically via a unique .tmp file and os.replace.
+
+    多进程/多线程并发写同一文件时，裸 open("w") 会读到半截 JSON；
+    tmp + os.replace 保证读者要么看到旧完整版，要么看到新完整版。
+    """
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=indent)
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def safe_user_id(user_id):
+    """Normalize user_id into a safe filename stem (shared by wxbot and hooks)."""
+    return re.sub(r"[^A-Za-z0-9_@.\-]", "_", str(user_id or ""))[:64]
+
+
 def load_creds():
     with open(CREDS) as f:
         return json.load(f)
 
 
 def save_creds(creds):
-    tmp = CREDS + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(creds, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, CREDS)
+    _atomic_write_json(CREDS, creds, indent=2, mode=0o600)
+
+
+def _load_typing_tickets():
+    try:
+        with open(TYPING_TICKETS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ensure_typing_ticket(api, user_id):
+    """获取或复用缓存的 typing_ticket（有效期约 20 小时）。
+
+    2026-10-16 借鉴 nanoclaw #1553 实测：getconfig 请求体必须显式带 ilink_user_id，
+    否则返回 ret=-2 errmsg='ilink_user_id required'。票据损坏/过期时重新获取。
+    """
+    if not user_id:
+        return ""
+    now = time.time()
+    tickets = _load_typing_tickets()
+    cached = tickets.get(str(user_id))
+    if isinstance(cached, dict):
+        try:
+            tk = cached.get("ticket", "")
+            exp = float(cached.get("expires_at", 0) or 0)
+        except (TypeError, ValueError):
+            tk, exp = "", 0
+        if tk and now < exp:
+            return tk
+    ticket = ""
+    try:
+        if hasattr(api, "_post"):
+            r = api._post("ilink/bot/getconfig", {
+                "ilink_user_id": str(user_id),
+                "base_info": {"channel_version": "2.0.1"},
+            }, retries=0)
+            if isinstance(r, dict):
+                ticket = str(r.get("typing_ticket", "") or "")
+        elif hasattr(api, "get_config"):
+            r = api.get_config(str(user_id))
+            if isinstance(r, dict):
+                ticket = str(r.get("typing_ticket", "") or "")
+    except Exception:
+        return ""
+    if ticket:
+        tickets[str(user_id)] = {
+            "ticket": ticket,
+            "expires_at": now + TYPING_TICKET_TTL,
+        }
+        try:
+            _atomic_write_json(TYPING_TICKETS_FILE, tickets)
+        except Exception:
+            pass
+    return ticket
+
+
+def send_typing_indicator(api, user_id, command=1):
+    """发送或取消微信原生“对方正在输入…”状态（command: 1=显示, 2=取消）。
+
+    2026-10-16 借鉴 nanoclaw #1553 与 agentserver：请求体同时携带 ilink_user_id
+    与 to_user_id，并同时传 command 与 status 字段以兼容不同网关节点。
+    完全不消耗 10 条 sendmessage 回复配额；任何异常静默忽略，绝不阻塞主流程。
+    注意：本轮只发一次（无 keepalive），长思考时指示灯可能中途过期——
+    ack_timer 每 3 秒 keepalive 续上（ack 文字已于 2026-10-16 去掉，指示灯已覆盖反馈）。
+    仅普通回复路径调用：proactive（快讯/早报/卡片）的取消会误关正在思考的回复的指示灯。
+    proactive（快讯/早报/卡片）的取消会误关正在思考的回复的指示灯。
+    """
+    if not user_id or not hasattr(api, "_post"):
+        return False
+    try:
+        ticket = _ensure_typing_ticket(api, user_id)
+        if not ticket:
+            return False
+        r = api._post("ilink/bot/sendtyping", {
+            "ilink_user_id": str(user_id),
+            "to_user_id": str(user_id),
+            "typing_ticket": ticket,
+            "command": int(command),
+            "status": int(command),
+            "base_info": {"channel_version": "2.0.1"},
+        }, retries=0)
+        return isinstance(r, dict) and r.get("ret", 0) == 0
+    except Exception:
+        return False
+
+
+def cmd_typing(user_id, command=1):
+    """CLI 入口：wxbot.py typing <user_id> <command>。供 ack_timer.sh keepalive 调用。"""
+    creds = load_creds()
+    api = WeixinApi(base_url=creds.get("base_url", DEFAULT_BASE_URL),
+                    token=creds.get("token", ""))
+    return send_typing_indicator(api, user_id, command=command)
 
 
 def _load_quota():
@@ -81,10 +195,7 @@ def _load_quota():
 
 
 def _save_quota(n):
-    tmp = QUOTA_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump({"sent_since_inbound": int(n)}, f)
-    os.replace(tmp, QUOTA_FILE)
+    _atomic_write_json(QUOTA_FILE, {"sent_since_inbound": int(n)})
 
 
 def _quota_reset():
@@ -119,8 +230,7 @@ def cmd_qr():
     if not qrcode:
         print("QR_FAIL", r)
         sys.exit(1)
-    with open(QRFILE, "w") as f:
-        json.dump({"qrcode": qrcode, "content": content, "ts": time.time()}, f)
+    _atomic_write_json(QRFILE, {"qrcode": qrcode, "content": content, "ts": time.time()})
     render_qr_png(content)
     print("QR_OK")
 
@@ -209,16 +319,22 @@ def append_history(user_id, role, text):
         return
     try:
         os.makedirs(HISTORY_DIR, exist_ok=True)
-        safe = re.sub(r"[^A-Za-z0-9_@.\-]", "_", str(user_id))[:64]
+        safe = safe_user_id(user_id)
+        if not safe:
+            return
         path = os.path.join(HISTORY_DIR, safe + ".jsonl")
+        line = json.dumps({"ts": time.time(), "role": role, "text": text},
+                          ensure_ascii=False) + "\n"
         with open(path, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "role": role, "text": text},
-                               ensure_ascii=False) + "\n")
+            f.write(line)
         with open(path) as f:
             lines = f.readlines()
         if len(lines) > HISTORY_MAX_LINES:
-            with open(path, "w") as f:
+            # 截头用 tmp + os.replace：裸 open("w") 截断期间读者会看到空文件
+            tmp = "%s.%d.tmp" % (path, os.getpid())
+            with open(tmp, "w") as f:
                 f.writelines(lines[-HISTORY_MAX_LINES:])
+            os.replace(tmp, path)
     except Exception as e:
         print("HISTORY_FAIL", e, flush=True)
 
@@ -242,12 +358,15 @@ def cache_msg_text(cache, mid, text):
                     cache[k] = v
     except Exception:
         pass
-    cache[str(mid)] = text
+    # LRU：重复缓存的条目移到末尾（最新），否则它会按旧位置被当成最老条目驱逐。
+    s_mid = str(mid)
+    if s_mid in cache:
+        cache.pop(s_mid, None)
+    cache[s_mid] = text
     while len(cache) > MSGCACHE_MAX:
         cache.pop(next(iter(cache)))
     try:
-        with open(MSGCACHE, "w") as f:
-            json.dump(cache, f, ensure_ascii=False)
+        _atomic_write_json(MSGCACHE, cache)
     except Exception as e:
         print("CACHE_SAVE_FAIL", e, flush=True)
 
@@ -277,6 +396,10 @@ def extract_ref_text(msg, cache):
     message's msg_id (message_item.type == 0), not its text -- CowAgent's
     parser assumes inline title/text and misses it. We resolve the id against
     recent messages cached by the receiver (both incoming and our own replies).
+
+    内存缓存 miss 时回读一次磁盘：接收器是长驻进程，内存缓存只在启动时
+    加载过一次，之后 cmd_send 进程写进磁盘的新条目它看不到；不回读，
+    引用刚发出去的机器人回复就解析不到。
     """
     for item in msg.get("item_list", []) or []:
         ref = item.get("ref_msg") or {}
@@ -290,10 +413,35 @@ def extract_ref_text(msg, cache):
         qid = str(ref_mi.get("msg_id", "") or "")
         if not ref_body and qid:
             ref_body = cache.get(qid, "")
+            if not ref_body:
+                disk = load_msg_cache()
+                if isinstance(disk, dict) and disk:
+                    for k, v in disk.items():
+                        if k not in cache:
+                            cache[k] = v
+                    ref_body = cache.get(qid, "")
         bits = [p for p in (ref_title, ref_body) if p]
         if bits:
             return "[引用: %s]\n" % " | ".join(bits)
         return "[引用: 早些的消息]\n"
+    return ""
+
+
+def find_ref_image_path(msg):
+    """Resolve local path for a quoted inbound image.
+
+    用户引用一张历史图片提问时，ref_msg 只带被引用消息的 msg_id；
+    接收器下载入站图片时按 media/in_<qid>.jpg 落盘，命中即把路径给 worker，
+    worker 才能看到被引用的图。非图片引用（无对应文件）返回 ""。
+    """
+    for item in msg.get("item_list", []) or []:
+        ref = item.get("ref_msg") or {}
+        ref_mi = ref.get("message_item") or {}
+        qid = str(ref_mi.get("msg_id", "") or "")
+        if qid:
+            cand = os.path.join(MEDIA, "in_%s.jpg" % qid)
+            if os.path.isfile(cand):
+                return cand
     return ""
 
 
@@ -436,12 +584,39 @@ def download_inbound_image(api, item, mid):
         return ""
 
 
+def _is_msg_already_processed(mid):
+    """磁盘去重兜底：msg_id 是否已在 pipeline 目录里（防重启后重复处理）。
+
+    内存 seen 只在进程内有效；接收器重启后 seen 为空，buf 游标若回退
+    （或服务端重推），同一条消息会再次进 inbox。磁盘上有记录 = 已处理过。
+    """
+    fn = "%s.json" % mid
+    for d in (INBOX, PROCESSING, DONE, SENT):
+        if os.path.exists(os.path.join(d, fn)):
+            return True
+    return False
+
+
 def cmd_receive(drain=False):
+    # 单实例锁：flock 随进程结束自动释放。pgrep + kill 去重曾多次误杀/漏杀
+    # （2026-09-30 双实例、2026-10-10 误杀真进程）；锁在内核层面保证同一时刻
+    # 只有一个接收器，第二个 receive 直接退出，不再靠外部脚本数进程。
+    recv_lock_fh = open(RECEIVE_LOCK, "w")
+    try:
+        fcntl.flock(recv_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("RECV_ALREADY_RUNNING", flush=True)
+        recv_lock_fh.close()
+        return
+
     creds = load_creds()
     api = WeixinApi(base_url=creds.get("base_url", DEFAULT_BASE_URL),
                     token=creds.get("token", ""))
     buf = open(BUF).read().strip() if os.path.exists(BUF) else ""
-    seen = set()
+    # 有序去重集：超 SEEN_MAX 按 LRU 丢最老（24/7 长驻，裸 set 会无限增长）；
+    # 丢掉的旧 id 由 _is_msg_already_processed 用磁盘兜底。
+    import collections
+    seen = collections.OrderedDict()
     failures = 0
     msg_cache = load_msg_cache()
     while True:
@@ -465,9 +640,9 @@ def cmd_receive(drain=False):
             print("RECV_API_ERROR", ret, errcode, flush=True)
             time.sleep(5)
             continue
-        buf = resp.get("get_updates_buf", buf)
-        with open(BUF, "w") as f:
-            f.write(buf)
+        # 游标先不写盘：本轮消息处理完再写。崩溃在循环中途时游标未推进，
+        # 重启后会重拉本轮消息（磁盘去重兜底，不会重复回复）；先写游标则丢消息。
+        new_buf = resp.get("get_updates_buf", buf)
         for m in resp.get("msgs", []) or []:
             mtype = m.get("message_type", 0)
             if mtype == 2:
@@ -480,9 +655,11 @@ def cmd_receive(drain=False):
             if mtype != 1:
                 continue
             mid = str(m.get("message_id", m.get("seq", uuid.uuid4().hex[:8])))
-            if mid in seen:
+            if mid in seen or _is_msg_already_processed(mid):
                 continue
-            seen.add(mid)
+            seen[mid] = True
+            while len(seen) > SEEN_MAX:
+                seen.popitem(last=False)
             if drain:
                 continue
             text = extract_text(m)
@@ -494,9 +671,14 @@ def cmd_receive(drain=False):
             img_item = find_image_item(m)
             if img_item:
                 image_path = download_inbound_image(api, img_item, mid)
+            if not image_path:
+                # 无直发图片时，试引用图片（用户引用历史图片提问）
+                image_path = find_ref_image_path(m)
             if not text and not image_path:
-                # 用户发了视频/文件：以前静默丢弃，现在转成标记让 worker 看到、
-                # 由 Muse 如实回复"收到了但暂时看不了"，而不是装没看见
+                # 用户发了视频/文件/语音：以前静默丢弃，现在转成标记让 worker 看到、
+                # 由 Muse 如实回复"收到了但暂时看不了"，而不是装没看见。
+                # 语音无转写也进 [语音]：此前无转写语音被跳过，用户得不到任何回应；
+                # RESPONDER 会让 worker 如实说没收到语音文字、请对方发文字。
                 media_note = ""
                 for item in m.get("item_list", []) or []:
                     itype = item.get("type", 0)
@@ -505,6 +687,9 @@ def cmd_receive(drain=False):
                         break
                     if itype == 4:
                         media_note = "[文件]"
+                        break
+                    if itype == 3:
+                        media_note = "[语音]"
                         break
                 if not media_note:
                     continue
@@ -527,12 +712,21 @@ def cmd_receive(drain=False):
             }
             if image_path:
                 rec["image"] = image_path
-            with open(os.path.join(INBOX, mid + ".json"), "w") as f:
-                json.dump(rec, f, ensure_ascii=False)
+            _atomic_write_json(os.path.join(INBOX, mid + ".json"), rec)
             append_history(rec["from"], "user", text)  # 会话历史：用户侧
             _quota_reset()  # 用户入站：ilink 回复配额清零
+            # 立即触发微信原生“对方正在输入…”（0.2s 反馈，不占 10 条配额；
+            # 失败静默忽略，ack_timer 仍是兜底）
+            _typing_ok = send_typing_indicator(api, rec["from"], command=1)
+            print("TYPING", mid, _typing_ok, flush=True)
             desc = text[:30].replace("\n", " ") if text else "[图片]"
             print("INBOX", mid, desc, flush=True)
+
+        buf = new_buf
+        buf_tmp = "%s.%d.tmp" % (BUF, os.getpid())
+        with open(buf_tmp, "w") as f:
+            f.write(buf)
+        os.replace(buf_tmp, BUF)
 
 
 def _is_stale_ack(fn):
@@ -541,13 +735,16 @@ def _is_stale_ack(fn):
     sent/<id>.json 或 done/<id>.json 存在 = 回复已送达，
     此时再发"收到，正在想，稍等…"只会让用户困惑（2026-09-29 实测：
     ack 的 API 请求比真正回复晚到服务器，导致先看到答案、后看到"正在想"）。
+    outbox/<id>.json 已存在 = 回复已写好、马上就发，此时 ack 也是多余的
+    （用户下一秒就看到正文，不需要先看一条"正在想"）。
     过期则直接归档，不再发送。
     """
     if not fn.startswith("ack_"):
         return False
     base = fn[len("ack_"):]
     return (os.path.exists(os.path.join(SENT, base))
-            or os.path.exists(os.path.join(DONE, base)))
+            or os.path.exists(os.path.join(DONE, base))
+            or os.path.exists(os.path.join(OUTBOX, base)))
 
 
 def cmd_send(only=None):
@@ -601,10 +798,7 @@ def _load_parts_ledger(fn):
 
 def _mark_part_done(fn, parts, pid):
     parts.add(pid)
-    tmp = _parts_ledger_path(fn) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(sorted(parts), f)
-    os.replace(tmp, _parts_ledger_path(fn))
+    _atomic_write_json(_parts_ledger_path(fn), sorted(parts))
 
 
 def _clear_parts_ledger(fn):
@@ -690,19 +884,41 @@ def _is_transient_send_fail(resp):
 def _send_one_file(api, msg_cache, fn, path):
     """发送单个 outbox 任务。返回 (ok, transient)：
     ok=True 整单成功；ok=False 且 transient=True 是瞬时故障、可重试；
-    transient=False 是永久性失败，重试也发不出去。"""
+    transient=False 是永久性失败，重试也发不出去。
+
+    图文混排：文本分段发送的同时，后台线程提前跑图片 CDN 上传
+    （上传本身不发给用户、不占配额，只是把加密包备好），文字发完直接
+    send_image_item，省一次串行上传等待。上传失败不影响文字分片：
+    文本已落地记账本，重试只补图片。
+    0.5s 间隔只用在"后面还有分片/附件"时：最后一片发完直接收尾，
+    不再空等半秒。
+    """
     try:
         with open(path) as f:
             job = json.load(f)
         to, ctx, text = job["to"], job.get("context_token", ""), job.get("text", "")
         reply_parts = []  # 本次实际发出的内容，整单成功后一次性记入历史
         parts_done = _load_parts_ledger(fn)  # 已落地的分片，重试时跳过
-        chunks = split_text(text) or [""]
+        chunks = split_text(text) if text else [""]
+        img = job.get("image")
+        vid = job.get("video")
+        fpath = job.get("file")
+        has_media = bool(img or vid or fpath)
+
+        # 图文并行：文本发送的同时，后台线程跑 CDN 上传流水线
+        img_future = None
+        if img and os.path.isfile(img) and "image" not in parts_done:
+            from concurrent.futures import ThreadPoolExecutor
+            executor = ThreadPoolExecutor(max_workers=1)
+            img_future = executor.submit(upload_media_to_cdn, api, img, to, 1)
+
         for i, ch in enumerate(chunks):
             pid = "text:%d" % i
             if pid in parts_done:
                 reply_parts.append(ch)  # 历史仍记全量
                 continue
+            if not ch and has_media and len(chunks) == 1:
+                continue  # 纯图片单：跳过空文本分片，不发一条空消息
             r = send_text_retry(api, to, ctx, ch, fn)
             if not r or r.get("ret", 0) != 0:
                 print("SEND_FAIL", fn, r, flush=True)
@@ -710,25 +926,32 @@ def _send_one_file(api, msg_cache, fn, path):
             cache_msg_text(msg_cache, _resp_msg_id(r), ch)
             reply_parts.append(ch)
             _mark_part_done(fn, parts_done, pid)
-            time.sleep(0.5)
-        img = job.get("image")
+            if (i + 1 < len(chunks)) or has_media:
+                time.sleep(0.5)
         if img:
             if not os.path.isfile(img):
                 print("SEND_FAIL", fn, "image not found:", img, flush=True)
                 return False, False
             if "image" not in parts_done:
-                up = upload_media_to_cdn(api, img, to, media_type=1)
+                try:
+                    up = (img_future.result() if img_future
+                          else upload_media_to_cdn(api, img, to, media_type=1))
+                except Exception as e:
+                    print("SEND_FAIL", fn, "image upload exc:", e, flush=True)
+                    return False, True
                 r = api.send_image_item(to, ctx, up["encrypt_query_param"],
                                         up["aes_key_b64"], up["ciphertext_size"])
                 check_send_response(r, fn)
                 if r.get("ret", 0) != 0:
                     print("SEND_FAIL", fn, "image:", r, flush=True)
                     return False, _is_transient_send_fail(r)
-                cache_msg_text(msg_cache, _resp_msg_id(r), "[图片]")
+                # 图片缓存带正文前 60 字：用户引用这条图片消息时，worker 能认出是哪张图
+                img_label = "[图片]" if not text else "[图片] %s" % text[:60]
+                cache_msg_text(msg_cache, _resp_msg_id(r), img_label)
                 _mark_part_done(fn, parts_done, "image")
             reply_parts.append("[图片]")
-            time.sleep(0.5)
-        vid = job.get("video")
+            if vid or fpath:
+                time.sleep(0.5)
         if vid:
             if not os.path.isfile(vid):
                 print("SEND_FAIL", fn, "video not found:", vid, flush=True)
@@ -744,8 +967,8 @@ def _send_one_file(api, msg_cache, fn, path):
                 cache_msg_text(msg_cache, _resp_msg_id(r), "[视频]")
                 _mark_part_done(fn, parts_done, "video")
             reply_parts.append("[视频]")
-            time.sleep(0.5)
-        fpath = job.get("file")
+            if fpath:
+                time.sleep(0.5)
         if fpath:
             if not os.path.isfile(fpath):
                 print("SEND_FAIL", fn, "file not found:", fpath, flush=True)
@@ -763,11 +986,18 @@ def _send_one_file(api, msg_cache, fn, path):
                                "[文件] " + os.path.basename(fpath))
                 _mark_part_done(fn, parts_done, "file")
             reply_parts.append("[文件] " + os.path.basename(fpath))
-            time.sleep(0.5)
         if os.path.exists(SEND_EXPIRED_MARKER):
             os.remove(SEND_EXPIRED_MARKER)
-        append_history(to, "assistant",  # 会话历史：整单成功才记
-                       "\n".join(p for p in reply_parts if p) or "[空回复]")
+        # ack 延迟提示不记会话历史：它是"正在想"的占位提示，不是真正的回复；
+        # 记进去 worker 再读上文时会看到一句自己没说过的"正在想"，是噪音。
+        if not fn.startswith("ack_"):
+            append_history(to, "assistant",  # 会话历史：整单成功才记
+                           "\n".join(p for p in reply_parts if p) or "[空回复]")
+            # 正式回复发出后取消“对方正在输入…”；仅普通回复文件：
+            # proactive（快讯/早报/卡片/汇总）的取消会误关正在思考的回复的指示灯。
+            if not fn.startswith(("flash-", "briefing-", "market-", "digest-")) \
+                    and not fn.endswith("-digest.json"):
+                send_typing_indicator(api, to, command=2)
         os.replace(path, os.path.join(SENT, fn))
         _clear_parts_ledger(fn)
         print("SENT", fn, flush=True)
@@ -833,10 +1063,7 @@ def _record_digest_items_to_shared_pool(items):
             if ts >= cutoff:
                 kept.append(e)
         pool["pushed"] = kept
-        tmp = SHARED_POOL + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(pool, f, ensure_ascii=False)
-        os.replace(tmp, SHARED_POOL)
+        _atomic_write_json(SHARED_POOL, pool)
         print("SHARED_POOL_RECORDED", n_new, flush=True)
     except Exception as e:
         print("SHARED_POOL_FAIL", e, flush=True)
@@ -860,7 +1087,7 @@ def _extract_pool_titles(fn, text):
                 if t:
                     titles.append(t)
     else:
-        title = (text or "").split("\n")[0].strip()
+        title = (text or "").lstrip().split("\n")[0].strip()
         title = re.sub(r"^[⚡\s]*快讯：?", "", title).strip()
         if title:
             titles.append(title)
@@ -893,6 +1120,12 @@ def cmd_merge_backlog():
     加锁执行，与 send 互斥，避免和正在发送的文件打架。
     2026-10-11 18:59：合并前查 msg_cache，已送达的文本不再收进
     汇总（防重复推送）；该文件直接删除（文本已出，图片为辅）。
+    2026-10-16：剔除已送达后若只剩 1 条，不包成"1 条汇总"（单条
+    本来就是完整快讯，包一层汇总是多此一举），留它原样待发。
+    同分钟已有 digest 时吸收合并（不覆盖）：两轮合并撞到同一分钟
+    文件名时，旧 digest 的标题必须收进新 digest，否则旧标题随覆盖丢失
+    （原文件已在上一轮删除，标题只剩 digest 里有）。
+    只删真正合并进来的文件：解析失败的文件不删，留着排查。
     """
     lock_fh = open(SEND_LOCK, "w")
     try:
@@ -905,7 +1138,7 @@ def cmd_merge_backlog():
             print("MERGE_SKIP", len(files), flush=True)
             return
         msg_cache = load_msg_cache()
-        items, to = [], None
+        items, merged_fns, to = [], [], None
         for fn in files:
             try:
                 with open(os.path.join(OUTBOX, fn)) as f:
@@ -925,24 +1158,37 @@ def cmd_merge_backlog():
                 continue
             if to is None:
                 to = job.get("to")
-            title = text.split("\n")[0].strip()
+            title = text.lstrip().split("\n")[0].strip()
             title = re.sub(r"^[⚡\s]*快讯：?", "", title).strip()
             if title:
                 items.append(title)
+                merged_fns.append(fn)
         if not to or not items:
             print("MERGE_FAIL", "no usable content", flush=True)
+            return
+        if len(items) < 2:
+            print("MERGE_SKIP_SINGLE", len(items), flush=True)
             return
         # 文件名时间戳用 Asia/Shanghai（VM 本地是 UTC，直接 strftime 会差 8 小时）
         ts = (datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
               .strftime("%Y%m%d%H%M"))
         digest_fn = "flash-%s-digest.json" % ts
+        digest_path = os.path.join(OUTBOX, digest_fn)
+        if os.path.exists(digest_path):
+            # 同分钟已有 digest：把它的标题吸收进来，不覆盖丢标题
+            try:
+                with open(digest_path) as f:
+                    old_digest = json.load(f)
+                old_titles = _extract_pool_titles(digest_fn, old_digest.get("text", ""))
+                for ot in reversed(old_titles):
+                    if ot not in items:
+                        items.insert(0, ot)
+            except (OSError, ValueError):
+                pass
         digest_text = ("📰 快讯汇总（%d条，通道恢复补发）\n" % len(items)
                        + "\n".join("· " + t for t in items))
-        tmp = os.path.join(OUTBOX, digest_fn + ".tmp")
-        with open(tmp, "w") as f:
-            json.dump({"to": to, "text": digest_text}, f, ensure_ascii=False)
-        os.replace(tmp, os.path.join(OUTBOX, digest_fn))
-        for fn in files:
+        _atomic_write_json(digest_path, {"to": to, "text": digest_text})
+        for fn in merged_fns:
             try:
                 os.remove(os.path.join(OUTBOX, fn))
             except OSError:
@@ -951,7 +1197,7 @@ def cmd_merge_backlog():
         # 2026-10-11 15:38 重复推送事故：合并后各条标题必须记入共享去重池，
         # 否则后续快讯轮的去重检查漏掉它们，同一新闻会被重复推送。
         _record_digest_items_to_shared_pool(items)
-        print("MERGED", len(files), "->", digest_fn, flush=True)
+        print("MERGED", len(merged_fns), "->", digest_fn, flush=True)
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -968,7 +1214,7 @@ def cmd_finish(msg_id, expected_claim_ts=None):
     发送复用 cmd_send 的加锁逻辑，但只发本单文件（only=<id>.json），
     绝不碰 outbox 里其他文件（快讯/早报/卡片等 proactive 只由显式 send 发；
     2026-10-16 隔离修复：此前 finish 调全量 send，普通回复会顺带发走 proactive）。
-    失败时 processing 留在原地，由 5 分钟兜底 cron 接手，绝不静默丢单。
+    失败时 processing 留在原地，由兜底 hook 接手，绝不静默丢单。
 
     expected_claim_ts（可选）：worker 从唤醒 payload 里拿到的 claim_ts。
     看门狗超时回收后 hook 会重新认领并改写 claim_ts；此时旧 worker 已是过时认领，
@@ -1025,11 +1271,25 @@ def cmd_finish(msg_id, expected_claim_ts=None):
     except (OSError, ValueError):
         print("FINISH_FAIL", msg_id, "no usable outbox file", flush=True)
         return 1
+    # 回填兜底：worker 漏写 to / context_token 时从 processing 补，
+    # 否则 send 会因缺字段失败；processing 是认领时写入的可信来源。
+    need_rewrite = False
+    if not job.get("to") and proc.get("from"):
+        job["to"] = proc["from"]
+        need_rewrite = True
+    if "context_token" not in job and proc.get("context_token"):
+        job["context_token"] = proc["context_token"]
+        need_rewrite = True
+    if need_rewrite:
+        _atomic_write_json(out_path, job)
     out_mtime = os.path.getmtime(out_path)
 
     cmd_send(only=msg_id + ".json")  # 只发本单，绝不碰 outbox 里其他文件
 
-    if not os.path.exists(os.path.join(SENT, msg_id + ".json")):
+    # 成功判定必须两条都满足：outbox 文件已消费（不在了）且 sent/ 有归档。
+    # 只看 sent/ 会误判：历史上已发过同 id（sent/ 有旧记录），但本轮 outbox
+    # 任务发送失败、文件还在，再报 FINISH_OK 就把未发出的回复当发出了。
+    if os.path.exists(out_path) or not os.path.exists(os.path.join(SENT, msg_id + ".json")):
         print("FINISH_FAIL", msg_id, "send incomplete, left for fallback",
               flush=True)
         return 1
@@ -1074,7 +1334,11 @@ if __name__ == "__main__":
     elif cmd == "receive":
         cmd_receive(drain="--drain" in sys.argv)
     elif cmd == "send":
-        cmd_send()
+        # send [only_fn]：不带参数 = 全量（显式 send、proactive）；
+        # 带一个文件名 = 只发它（ack_timer 的本单 ack、worker 的预告都走这里，
+        # 绝不触发全量带走 outbox 里其他文件）。
+        only_arg = sys.argv[2] if len(sys.argv) > 2 else None
+        cmd_send(only=only_arg)
     elif cmd == "merge-backlog":
         cmd_merge_backlog()
     elif cmd == "finish":
@@ -1082,6 +1346,17 @@ if __name__ == "__main__":
             print("usage: wxbot.py finish <msg_id> [expected_claim_ts]", flush=True)
             sys.exit(1)
         sys.exit(cmd_finish(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None))
+    elif cmd == "typing":
+        # wxbot.py typing <user_id> <command: 1=显示, 2=取消>
+        # 供 ack_timer.sh 每 3 秒 keepalive 调用（单次短命进程，不占配额）。
+        if len(sys.argv) < 4:
+            print("usage: wxbot.py typing <user_id> <command>", flush=True)
+            sys.exit(1)
+        try:
+            command = int(sys.argv[3])
+        except ValueError:
+            command = 1
+        sys.exit(0 if cmd_typing(sys.argv[2], command=command) else 1)
     else:
-        print("usage: wxbot.py {qr|wait_login|receive [--drain]|send|merge-backlog|finish <msg_id> [expected_claim_ts]}")
+        print("usage: wxbot.py {qr|wait_login|receive [--drain]|send [only_fn]|merge-backlog|finish <msg_id> [expected_claim_ts]|typing <user_id> <command>}")
         sys.exit(1)
