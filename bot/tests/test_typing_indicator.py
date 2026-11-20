@@ -58,6 +58,13 @@ def make_env(wxbot):
     wxbot.SEND_LOCK = os.path.join(tmp, "send.lock")
     wxbot.RECEIVE_LOCK = os.path.join(tmp, "receive.lock")
     wxbot.TYPING_TICKETS_FILE = os.path.join(tmp, "typing_tickets.json")
+    wxbot.REPLY_MAP = os.path.join(tmp, "reply_map.json")
+    wxbot.SEND_LEDGER = os.path.join(tmp, "send_ledger.json")
+    wxbot.SEND_LEDGER_LOCK = os.path.join(tmp, "send_ledger.lock")
+    wxbot.SEND_AUDIT = os.path.join(tmp, "send_audit.jsonl")
+    wxbot.QUOTE_CACHE_FILE = os.path.join(tmp, "quote_cache.json")
+    wxbot.TOKEN_STALE_FILE = os.path.join(tmp, "token_stale.json")
+
     wxbot.LATENCY_LOG = os.path.join(tmp, "wechat-latency.jsonl")
     wxbot.SHARED_POOL = os.path.join(tmp, "pushed-shared.json")
     wxbot.MSGCACHE = os.path.join(tmp, "msg_cache.json")
@@ -71,7 +78,7 @@ def write_json(path, obj):
 
 
 def test_send_typing_indicator_and_ticket_cache():
-    """nanoclaw #1553：getconfig 必须带 ilink_user_id；票据缓存 20h，第二
+    """nanoclaw #1553：getconfig 必须带 ilink_user_id；票据缓存 540s，第二
     次调用不重复调 getconfig。"""
     wxbot = load_wxbot()
     make_env(wxbot)
@@ -95,9 +102,45 @@ def test_send_typing_indicator_and_ticket_cache():
     assert wxbot.send_typing_indicator(api, "wxid_peter", command=1) is True
     assert len(posts) == 2  # 第 1 次：getconfig + sendtyping
     assert wxbot.send_typing_indicator(api, "wxid_peter", command=2) is True
-    assert len(posts) == 3  # 第 2 次：直接命中 20h 缓存，只发 sendtyping
+    assert len(posts) == 3  # 第 2 次：直接命中 540s 缓存，只发 sendtyping
     assert posts[2][0] == "ilink/bot/sendtyping"
     assert posts[2][1]["command"] == 2
+
+
+def test_typing_ticket_ttl_540s_and_fetched_at():
+    """2026-11-19 typing 回归：票据 TTL 540 秒（上游实测 9 分钟），不是
+    旧的 20 小时猜测；超过 TTL、或无 fetched_at 的旧格式条目都重取。"""
+    import time
+    wxbot = load_wxbot()
+    make_env(wxbot)
+    assert wxbot.TYPING_TICKET_TTL == 540
+    now = time.time()
+
+    class FakeTypingApi:
+        def __init__(self):
+            self.fetches = 0
+
+        def _post(self, endpoint, body, retries=0):
+            if endpoint == "ilink/bot/getconfig":
+                self.fetches += 1
+                return {"ret": 0, "typing_ticket": "tk-%d" % self.fetches}
+            return {"ret": 0}
+
+    api = FakeTypingApi()
+    # 旧格式条目：有 expires_at（20h 时代的远期值）但无 fetched_at → 重取
+    write_json(wxbot.TYPING_TICKETS_FILE, {
+        "u1": {"ticket": "old-20h", "expires_at": now + 20 * 3600}})
+    assert wxbot._ensure_typing_ticket(api, "u1") == "tk-1"
+    assert api.fetches == 1
+    # 新格式条目：fetched_at 在 TTL 内 → 命中缓存，不重取
+    assert wxbot._ensure_typing_ticket(api, "u1") == "tk-1"
+    assert api.fetches == 1
+    # fetched_at 超过 540 秒 → 重取
+    write_json(wxbot.TYPING_TICKETS_FILE, {
+        "u1": {"ticket": "tk-1", "fetched_at": now - 541,
+               "expires_at": now - 541 + 540}})
+    assert wxbot._ensure_typing_ticket(api, "u1") == "tk-2"
+    assert api.fetches == 2
 
 
 def test_send_typing_indicator_tolerates_corrupt_ticket_file():
@@ -199,6 +242,46 @@ def test_cmd_typing_cli_entry():
     assert wxbot.cmd_typing("u-cli", command=2) is True
     assert posts[2][0] == "ilink/bot/sendtyping"
     assert posts[2][1]["command"] == 2
+
+
+def test_ack_timer_actually_calls_typing():
+    """2026-11-19 根因回归：上一版 ack_timer.sh 写的是
+    `if ! cd "$BASE" && "$PY" wxbot.py typing ...`，bash 里 `!` 只否定
+    `cd`，cd 成功时 typing 调用永远不执行——指示灯只在接收器那一下闪
+    过，之后全程不亮，且没有任何失败日志。`bash -n` 查不出这种错，
+    必须用桩 python 实跑：8 秒内至少调 2 次；桩返回失败时必须写日志。"""
+    import shutil
+    import subprocess
+    tmp = tempfile.mkdtemp(prefix="acktimer-")
+    shutil.copy(os.path.join(BASE, "..", "ack_timer.sh"),
+                os.path.join(tmp, "ack_timer.sh"))
+    proc_dir = os.path.join(tmp, "processing")
+    os.makedirs(proc_dir)
+    open(os.path.join(proc_dir, "T1.json"), "w").close()
+    stub = os.path.join(tmp, "stub.py")
+    with open(stub, "w") as f:
+        f.write("#!/usr/bin/env python3\nimport sys\n"
+                "open(%r, 'a').write('called\\n')\n" % os.path.join(tmp, "calls.log")
+                + "sys.exit(0)\n")
+    os.chmod(stub, 0o755)  # 桩 python 是直接执行的，必须可执行（不加这行会 126 失败）
+    env = dict(os.environ, WECHAT_BOT_PYTHON=stub)
+    # ack_timer 是常驻循环，timeout 杀掉它是预期的行为，不是失败
+    for seconds in (8, 5):
+        try:
+            subprocess.run(["bash", "ack_timer.sh", "T1", "u1", "ctx"],
+                           cwd=tmp, env=env, timeout=seconds,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            pass
+        if seconds == 8:
+            with open(os.path.join(tmp, "calls.log")) as f:
+                assert len(f.readlines()) >= 2, "8 秒内 keepalive 至少应调 2 次 typing"
+            # 失败路径：桩返回 1 → ack_timer.log 里必须有 FAIL 记录
+            with open(stub, "w") as f:
+                f.write("#!/usr/bin/env python3\nimport sys\nsys.exit(1)\n")
+            os.chmod(stub, 0o755)
+    with open(os.path.join(tmp, "ack_timer.log")) as f:
+        assert "typing FAIL T1" in f.read()
 
 
 def test_image_cache_label_includes_text_snippet():

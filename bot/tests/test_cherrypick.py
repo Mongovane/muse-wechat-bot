@@ -58,6 +58,14 @@ def make_env(wxbot):
     wxbot.LATENCY_LOG = os.path.join(tmp, "wechat-latency.jsonl")
     wxbot.SHARED_POOL = os.path.join(tmp, "pushed-shared.json")
     wxbot.MSGCACHE = os.path.join(tmp, "msg_cache.json")
+    wxbot.REPLY_MAP = os.path.join(tmp, "reply_map.json")
+    wxbot.TYPING_TICKETS_FILE = os.path.join(tmp, "typing_tickets.json")
+    wxbot.SEND_LEDGER = os.path.join(tmp, "send_ledger.json")
+    wxbot.SEND_LEDGER_LOCK = os.path.join(tmp, "send_ledger.lock")
+    wxbot.SEND_AUDIT = os.path.join(tmp, "send_audit.jsonl")
+    wxbot.QUOTE_CACHE_FILE = os.path.join(tmp, "quote_cache.json")
+    wxbot.TOKEN_STALE_FILE = os.path.join(tmp, "token_stale.json")
+
     wxbot.time.sleep = lambda s: None
     return tmp, dirs
 

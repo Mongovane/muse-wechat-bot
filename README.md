@@ -51,9 +51,13 @@
 │   │   └── sweeper-gate-worker.md # 兜底门控唤醒的 worker 指令
 │   └── tests/              # 回归测试（pytest）
 ├── hooks/
+│   ├── definitions/
+│   │   ├── wechat-inbox.json           # hook 注册定义（prompt 以此为准）
+│   │   └── wechat-sweeper-gate.json    # 兜底门控 hook 注册定义
 │   └── scripts/
-│       ├── wechat-inbox.sh # 事件驱动脚本：看门狗 + 收件箱监听（5 秒）
-│       └── wechat-sweeper-gate.sh # 兜底门控：bash 看门狗 + 漏网唤醒（30 秒）
+│       ├── wechat-inbox.sh             # 事件驱动脚本：看门狗 + 收件箱监听（5 秒）+ 常驻 supervisor
+│       ├── wechat-sweeper-gate.sh      # 兜底门控：bash 看门狗 + 漏网唤醒（30 秒）
+│       └── wechat-receiver-supervisor.sh # 接收器 supervisor（30 秒一轮，兜底轮询停摆）
 ├── crons/
 │   └── README.md           # 说明：兜底已改为 hook 门控，不再有 agent cron
 ├── docs/

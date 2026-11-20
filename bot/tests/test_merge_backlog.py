@@ -35,6 +35,15 @@ def make_env(wxbot, n_flash):
     # 全部可写路径指向 tmp：测试绝不碰生产文件（2026-10-16 教训见
     # test_send_idempotent.py）。
     wxbot.MSGCACHE = os.path.join(tmp, "msg_cache.json")
+    # 2026-11-04 新增：回复送达账本 + typing 票据也指向 tmp
+    wxbot.REPLY_MAP = os.path.join(tmp, "reply_map.json")
+    wxbot.TYPING_TICKETS_FILE = os.path.join(tmp, "typing_tickets.json")
+    # 2026-11-19 新增：发送账本/审计/引用缓存/token stale 也指向 tmp
+    wxbot.SEND_LEDGER = os.path.join(tmp, "send_ledger.json")
+    wxbot.SEND_LEDGER_LOCK = os.path.join(tmp, "send_ledger.lock")
+    wxbot.SEND_AUDIT = os.path.join(tmp, "send_audit.jsonl")
+    wxbot.QUOTE_CACHE_FILE = os.path.join(tmp, "quote_cache.json")
+    wxbot.TOKEN_STALE_FILE = os.path.join(tmp, "token_stale.json")
     wxbot.QUOTA_FILE = os.path.join(tmp, "quota.json")
     wxbot.HISTORY_DIR = os.path.join(tmp, "history")
     os.makedirs(wxbot.HISTORY_DIR, exist_ok=True)

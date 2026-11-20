@@ -3,7 +3,8 @@
 # - 看门狗（bash 内完成，不唤醒 agent）：接收器死了 → 重启；卡死（buf.txt > 3 分钟
 #   未更新且进程已运行 > 3 分钟）→ kill 重启。逻辑与 wechat-inbox.sh 相同。
 # - 唤醒条件（只在真有漏网时唤醒 agent）：inbox 有 > 1 分钟未处理的文件；
-#   processing 认领超时（有 .alive 给 10 分钟，无 .alive 给 2 分钟）；
+#   processing 认领超时（无 .alive 给 2 分钟；有 .alive 但超过 180 秒没更新即视为已死，
+#   不等满 10 分钟；有 .alive 且 180 秒内更新过才给满 10 分钟）；
 #   登录态过期（接收侧 SESSION_EXPIRED 且接收器已死；发送侧 -14 标记）。
 # - proactive 的 outbox 文件单独存在不是唤醒条件（flash/早报/卡片 worker 自己发，
 #   兜底不碰）；只有 processing 超时的单才唤醒（有 outbox → finish，无 outbox → 重处理）。
@@ -126,8 +127,9 @@ if [ "${#stale_inbox[@]}" -gt 0 ]; then
 fi
 
 # --- 4. 漏网：processing 里超时的认领 ---
-# 有 .alive = worker 已启动，给 10 分钟；无 .alive = worker 没起来，给 2 分钟。
-# 超时起点用 claim_ts（hook 认领时写入），缺失则退回文件 mtime。
+# 有 .alive 且 180 秒内更新过 = worker 还在思考，给满 10 分钟；.alive 超过 180 秒
+# 没更新 = worker 已死或 hung，直接认领超时（不等 10 分钟）；无 .alive = worker
+# 没起来，给 2 分钟。超时起点用 claim_ts（hook 认领时写入），缺失则退回文件 mtime。
 timed_out=()
 for _p in "$BOT_DIR"/processing/*.json; do
   [ -e "$_p" ] || continue
@@ -141,8 +143,14 @@ for _p in "$BOT_DIR"/processing/*.json; do
     _cts="$(stat -c %Y "$_p" 2>/dev/null || echo "$now")"
   fi
   _age="$((now - _cts))"
+  _al_mtime="$(stat -c %Y "$BOT_DIR/processing/${_id}.alive" 2>/dev/null || echo 0)"
   if [ -f "$BOT_DIR/processing/${_id}.alive" ]; then _limit=600; else _limit=120; fi
+  # .alive 只在 worker 启动自检和每次写 outbox 时 touch：超过 180 秒没更新
+  # 说明 worker 已死或 hung（正常思考 < 60 秒、写 outbox 即续命），不等满 600 秒就认领超时。
+  # 误认领的代价有上限：claim_ts 归属校验 + FINISH_DUP 保证不重发，只浪费一次重做。
   if [ "$_age" -gt "$_limit" ]; then
+    timed_out+=("$_id")
+  elif [ "$_al_mtime" != "0" ] && [ "$((now - _al_mtime))" -gt 180 ]; then
     timed_out+=("$_id")
   fi
 done
